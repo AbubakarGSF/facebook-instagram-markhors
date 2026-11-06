@@ -38,3 +38,7 @@ HEALTH_CHECK_HOST = os.getenv("HEALTH_CHECK_HOST", "0.0.0.0")
 NETCHECK_ON_START = os.getenv("NETCHECK_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
 
 STATE_DIR = os.getenv("STATE_DIR", "./data")
+
+# Zip bomb protection
+ZIP_MAX_TOTAL = int(os.getenv("ZIP_MAX_TOTAL", str(256 * 1024 * 1024)))  # 256MB default
+ZIP_MAX_FILE = int(os.getenv("ZIP_MAX_FILE", str(16 * 1024 * 1024)))  # 16MB per entry

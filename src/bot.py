@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import tempfile
 import time
 import zipfile as _zipfile
@@ -19,11 +20,12 @@ import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config.settings import ADMIN_IDS, CREDIT, WEBSITE, MAX_FILES, STATE_DIR
+from config.settings import ADMIN_IDS, CREDIT, CONCURRENCY, MAX_FILES, PROXIES, STATE_DIR, WEBSITE, ZIP_MAX_TOTAL
 from src.database.supabase import SupabaseDB
 from src.platforms.base import BasePlatform
 from src.platforms.facebook import FacebookPlatform
 from src.platforms.instagram import InstagramPlatform
+from src.utils.crypto import decrypt_cookies, encrypt_cookies
 from src.utils.proxy import load_proxies, proxy_status_text, norm_proxy
 
 logger = logging.getLogger(__name__)
@@ -477,17 +479,28 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
     posted_count = 0
     failed_count = 0
 
-    for idx, acc in enumerate(accounts):
+    sem = asyncio.Semaphore(max(CONCURRENCY, 1))
+
+    async def process_account(acc):
+        nonlocal posted_count, failed_count
         if state.get("stop"):
-            break
+            return
 
         ck = acc.get("cookies", {})
         if not ck:
             failed_count += 1
-            continue
+            return
 
-        # Live check
-        cl = platform_obj.http_client()
+        # Decrypt cookies if they were stored encrypted
+        if _db and ck:
+            ck = decrypt_cookies(ck)
+
+        # Pick a proxy if available
+        proxy = None
+        if PROXIES:
+            proxy = random.choice(PROXIES)
+
+        cl = platform_obj.http_client(proxy=proxy)
         try:
             check = await platform_obj.live_check(cl, ck)
         finally:
@@ -496,7 +509,7 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
         status = check.get("Status", "UNKNOWN")
         if status != "LIVE":
             failed_count += 1
-            continue
+            return
 
         # Check filters
         username = check.get("username", "")
@@ -504,9 +517,9 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
         followers = int(check.get("Followers", 0) or 0)
 
         if filt.get("countries") and country not in filt["countries"]:
-            continue
+            return
         if filt.get("min_followers", 0) > followers:
-            continue
+            return
 
         # Post
         text = random.choice(texts)
@@ -520,7 +533,7 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
                     "username": username,
                     "fb_id": check.get("fb_id", "") if platform == "facebook" else "",
                     "ig_id": check.get("ig_id", "") if platform == "instagram" else "",
-                    "cookies": ck,
+                    "cookies": encrypt_cookies(ck),
                     "country": country,
                     "followers": followers,
                     "verified": str(check.get("Verified", "false")).lower() == "true",
@@ -537,6 +550,10 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
         # Delay between accounts
         lo, hi = cfg["delay"]
         await asyncio.sleep(random.uniform(lo, hi))
+
+    # Process accounts with concurrency limit
+    tasks = [process_account(acc) for acc in accounts]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
     await update.message.reply_text(
         f"Campaign complete!\n"
@@ -566,9 +583,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("File process ho rahi hai...")
 
+    tmp = tempfile.mkdtemp(prefix="sm_")
     try:
         file = await context.bot.get_file(doc.file_id)
-        tmp = tempfile.mkdtemp(prefix="sm_")
         path = os.path.join(tmp, doc.file_name)
         await file.download_to_drive(path)
 
@@ -577,6 +594,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if doc.file_name.lower().endswith(".zip"):
             with _zipfile.ZipFile(path) as z:
                 names = [n for n in z.namelist() if n.lower().endswith(".txt")]
+                # Zip bomb protection: check total uncompressed size
+                total_uncompressed = sum(z.getinfo(n).file_size for n in names)
+                if total_uncompressed > ZIP_MAX_TOTAL:
+                    await msg.edit_text(
+                        f"Zip bomb detected: total uncompressed size {total_uncompressed // (1024*1024)}MB "
+                        f"exceeds limit {ZIP_MAX_TOTAL // (1024*1024)}MB"
+                    )
+                    return
                 for name in names[:MAX_FILES]:
                     raw = z.read(name).decode("utf-8", "ignore")
                     result = await _process_one(name, raw, state)
@@ -615,7 +640,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.exception("handle_file")
-        await msg.edit_text(f"Error: {str(e)}")
+        await msg.edit_text("File process karne mein error aaya. Dobara try karein.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 async def _process_one(name: str, raw: str, state: dict) -> tuple:
@@ -654,26 +681,23 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
 
     # Save LIVE accounts to DB
     if status == "LIVE" and _db:
-        import httpx
+        table = "fb_accounts" if platform == "facebook" else "ig_accounts"
+        encrypted_cookies = encrypt_cookies(cookies)
+        row = {
+            "username": meta.get("username", ""),
+            "fb_id": meta.get("fb_id", "") if platform == "facebook" else "",
+            "ig_id": meta.get("ig_id", "") if platform == "instagram" else "",
+            "cookies": encrypted_cookies,
+            "country": meta.get("country", ""),
+            "followers": int(meta.get("Followers", 0) or 0),
+            "verified": str(meta.get("Verified", "false")).lower() == "true",
+            "status": "live",
+            "source": "bot",
+        }
         async with httpx.AsyncClient() as cl:
-            table = "fb_accounts" if platform == "facebook" else "ig_accounts"
-            row = {
-                "username": meta.get("username", ""),
-                "fb_id": meta.get("fb_id", "") if platform == "facebook" else "",
-                "ig_id": meta.get("ig_id", "") if platform == "instagram" else "",
-                "cookies": cookies,
-                "country": meta.get("country", ""),
-                "followers": int(meta.get("Followers", 0) or 0),
-                "verified": str(meta.get("Verified", "false")).lower() == "true",
-                "status": "live",
-                "source": "bot",
-            }
             await _db.upsert(cl, table, [row])
 
     return (name, output, status)
-
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user_state.pop(uid, None)
     await update.message.reply_text("Cancel / reset.")
