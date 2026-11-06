@@ -36,3 +36,5 @@ HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", "0"))
 HEALTH_CHECK_HOST = os.getenv("HEALTH_CHECK_HOST", "0.0.0.0")
 
 NETCHECK_ON_START = os.getenv("NETCHECK_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
+
+STATE_DIR = os.getenv("STATE_DIR", "./data")

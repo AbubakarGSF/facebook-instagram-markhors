@@ -54,11 +54,16 @@ class FacebookPlatform(BasePlatform):
                 )
                 username = uname_match.group(1).strip() if uname_match else ""
 
+                # Try to extract user id from page
+                fb_id_match = re.search(r'userID["\']?\s*[:=]\s*["\']?(\d+)', html)
+                fb_id = fb_id_match.group(1) if fb_id_match else ""
+
                 return {
                     "Status": "LIVE",
                     "Platform": "facebook",
                     "username": username,
-                    "fb_id": "",
+                    "fb_id": fb_id,
+                    "ig_id": "",
                     "Reason": "",
                 }
 

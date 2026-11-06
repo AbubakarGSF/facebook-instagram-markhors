@@ -53,11 +53,16 @@ class InstagramPlatform(BasePlatform):
                 )
                 username = uname_match.group(1) if uname_match else ""
 
+                # Try to extract user id
+                ig_id_match = re.search(r'"pk"\s*:\s*"?(\d+)"?', html)
+                ig_id = ig_id_match.group(1) if ig_id_match else ""
+
                 return {
                     "Status": "LIVE",
                     "Platform": "instagram",
                     "username": username,
-                    "ig_id": "",
+                    "ig_id": ig_id,
+                    "fb_id": "",
                     "Reason": "",
                 }
 

@@ -20,6 +20,7 @@ from config.settings import (
 )
 from src.bot import (
     cancel_cmd,
+    camp_cmd,
     db_cmd,
     diag_cmd,
     handle_file,
@@ -32,6 +33,7 @@ from src.bot import (
     rework_cmd,
     start,
     status_cmd,
+    stopcamp_cmd,
     verify_cmd,
 )
 
@@ -86,6 +88,8 @@ def main():
         ("rework", rework_cmd),
         ("verify", verify_cmd),
         ("live", live_cmd),
+        ("camp", camp_cmd),
+        ("stopcamp", stopcamp_cmd),
         ("db", db_cmd),
         ("cancel", cancel_cmd),
     ]
