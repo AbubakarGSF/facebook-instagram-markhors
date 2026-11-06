@@ -3,6 +3,7 @@
 Live check, post, and cookie rework for Instagram accounts.
 """
 
+import asyncio
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from .base import BasePlatform
+from src.utils.ratelimit import rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -119,26 +121,43 @@ class InstagramPlatform(BasePlatform):
             "caption": text,
         }
 
-        try:
-            r = await client.post(
-                "https://www.instagram.com/api/v1/web/posts/create/",
-                headers=headers,
-                data=payload,
-            )
+        max_retries = 5
 
-            if r.status_code == 200:
-                return True, None, None
+        for attempt in range(max_retries):
+            try:
+                r = await client.post(
+                    "https://www.instagram.com/api/v1/web/posts/create/",
+                    headers=headers,
+                    data=payload,
+                )
 
-            if r.status_code == 429:
-                return False, None, "RATE"
+                if r.status_code == 200:
+                    return True, None, None
 
-            if r.status_code in (401, 403):
-                return False, None, "DEAD"
+                if r.status_code == 429:
+                    # Rate limited - wait and retry
+                    retry_after = None
+                    retry_after_header = r.headers.get("retry-after") or r.headers.get("Retry-After")
+                    if retry_after_header:
+                        try:
+                            retry_after = int(retry_after_header)
+                        except ValueError:
+                            retry_after = None
+                    wait = rate_limiter.record_response("instagram", 429, retry_after)
+                    if wait:
+                        await asyncio.sleep(wait)
+                        continue
+                    return False, None, "RATE"
 
-            return False, None, f"HTTP {r.status_code}"
+                if r.status_code in (401, 403):
+                    return False, None, "DEAD"
 
-        except httpx.ConnectError as e:
-            return False, None, "NET"
-        except Exception as e:
-            logger.exception("ig post")
-            return False, None, str(e)[:80]
+                return False, None, f"HTTP {r.status_code}"
+
+            except httpx.ConnectError as e:
+                return False, None, "NET"
+            except Exception as e:
+                logger.exception("ig post")
+                return False, None, str(e)[:80]
+
+        return False, None, "RATE_MAX_RETRIES"
