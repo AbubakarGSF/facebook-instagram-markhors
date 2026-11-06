@@ -39,8 +39,12 @@ class BasePlatform:
         return httpx.AsyncClient(**kw)
 
     def mask_cookie(self, cookie_str: str) -> str:
-        """Cookie string mein se credentials chhupao."""
-        return "***masked***"
+        """Mask cookie values in a cookie string for logging."""
+        if not cookie_str:
+            return cookie_str
+        # Mask value part of each cookie=value pair
+        masked = re.sub(r'([a-zA-Z_][a-zA-Z0-9_]*)=([^;]*)', r'\1=***masked***', cookie_str)
+        return masked
 
     def parse_cookie_file(self, text: str) -> Tuple[Dict[str, str], List[str]]:
         """Cookie file se cookies extract karo.
@@ -77,9 +81,9 @@ class BasePlatform:
             # key=value or key: value
             for sep in ("=", ":"):
                 if sep in line:
-                    k, v = line.split(sep, 1)
-                    k = k.strip()
-                    v = v.strip().strip('"').strip("'")
+                    idx = line.index(sep)
+                    k = line[:idx].strip()
+                    v = line[idx + len(sep):].strip().strip('"').strip("'")
                     if k and v and k not in seen:
                         seen.add(k)
                         data[k] = v
