@@ -22,7 +22,7 @@ import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config.settings import ADMIN_IDS, CREDIT, CONCURRENCY, MAX_FILES, PROXIES, STATE_DIR, WEBSITE, ZIP_MAX_TOTAL
+from config.settings import ADMIN_IDS, BOT_VERSION, CREDIT, CONCURRENCY, MAX_FILES, PROXIES, STATE_DIR, WEBSITE, ZIP_MAX_TOTAL
 from src.database.supabase import SupabaseDB
 from src.platforms.base import BasePlatform
 from src.platforms.facebook import FacebookPlatform

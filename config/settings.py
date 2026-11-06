@@ -1,5 +1,6 @@
 """Settings loader - Railway env vars se config load karta hai."""
 
+import logging
 import os
 from typing import Set
 
@@ -42,3 +43,6 @@ STATE_DIR = os.getenv("STATE_DIR", "./data")
 # Zip bomb protection
 ZIP_MAX_TOTAL = int(os.getenv("ZIP_MAX_TOTAL", str(256 * 1024 * 1024)))  # 256MB default
 ZIP_MAX_FILE = int(os.getenv("ZIP_MAX_FILE", str(16 * 1024 * 1024)))  # 16MB per entry
+
+# Bot version
+BOT_VERSION = "2.0.0"
