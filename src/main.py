@@ -2,11 +2,10 @@
 
 import asyncio
 import logging
-import os
 import sys
 
 from dotenv import load_dotenv
-from telegram.ext import ApplicationBuilder, CommandHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 from config.settings import (
     ADMIN_IDS,
@@ -15,17 +14,25 @@ from config.settings import (
     HEALTH_CHECK_HOST,
     HEALTH_CHECK_PORT,
     NETCHECK_ON_START,
+    SUPABASE_KEY,
+    SUPABASE_URL,
     WEBSITE,
 )
 from src.bot import (
+    cancel_cmd,
     db_cmd,
     diag_cmd,
+    handle_file,
     help_cmd,
+    init_db,
+    init_platforms,
+    live_cmd,
     netcheck_cmd,
     proxy_cmd,
     rework_cmd,
     start,
     status_cmd,
+    verify_cmd,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -33,7 +40,16 @@ logger = logging.getLogger(__name__)
 
 
 async def post_init(app):
-    logger.info("Bot starting...")
+    """Initialize DB and platforms after bot starts."""
+    # Initialize DB
+    db = init_db(SUPABASE_URL, SUPABASE_KEY)
+    if db:
+        logger.info("Supabase DB initialized")
+
+    # Initialize platforms
+    init_platforms()
+    logger.info("Platforms initialized (Facebook, Instagram)")
+
     if NETCHECK_ON_START:
         logger.info("Netcheck on start enabled")
 
@@ -59,6 +75,7 @@ def main():
         .build()
     )
 
+    # Command handlers
     handlers = [
         ("start", start),
         ("help", help_cmd),
@@ -67,10 +84,18 @@ def main():
         ("proxy", proxy_cmd),
         ("netcheck", netcheck_cmd),
         ("rework", rework_cmd),
+        ("verify", verify_cmd),
+        ("live", live_cmd),
         ("db", db_cmd),
+        ("cancel", cancel_cmd),
     ]
     for cmd, fn in handlers:
         app.add_handler(CommandHandler(cmd, fn))
+
+    # Document handler for cookie file uploads
+    app.add_handler(
+        MessageHandler(filters.Document.ALL, handle_file)
+    )
 
     logger.info("Social Markhors Bot running | admins: %s", len(ADMIN_IDS))
     app.run_polling(drop_pending_updates=True)

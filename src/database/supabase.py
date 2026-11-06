@@ -1,12 +1,12 @@
 """Supabase database client for Social Markhors Bot.
 
-Alag tables banengi Facebook aur Instagram ke liye:
+Alag tables Facebook aur Instagram ke liye:
   - fb_accounts
   - ig_accounts
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -50,7 +50,7 @@ class SupabaseDB:
         if not self.enabled or not rows:
             return 0, "db off" if rows else None
 
-        # Same username conflict handling
+        # Same username/id conflict handling
         uniq: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             uname = row.get("username") or row.get("fb_id") or row.get("ig_id")
@@ -105,3 +105,19 @@ class SupabaseDB:
             except Exception:
                 logger.exception("supabase delete")
         return ok
+
+    async def fetch(self, client: httpx.AsyncClient, table: str, params: dict, limit: int = 500, offset: int = 0) -> List[Dict[str, Any]]:
+        try:
+            p = dict(params)
+            p["select"] = "*"
+            p["limit"] = str(limit)
+            p["offset"] = str(offset)
+            p.setdefault("order", "id.asc")
+            r = await client.get(self.table_url(table), params=p, headers=self.headers)
+            if r.status_code >= 300:
+                logger.warning("supabase fetch %s %s", r.status_code, r.text[:200])
+                return []
+            return r.json() or []
+        except Exception:
+            logger.exception("supabase fetch")
+            return []

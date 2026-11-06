@@ -1,9 +1,10 @@
 """Instagram platform module.
 
-Live check, post, and db helpers for Instagram accounts.
+Live check, post, and cookie rework for Instagram accounts.
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -16,9 +17,9 @@ logger = logging.getLogger(__name__)
 class InstagramPlatform(BasePlatform):
     NAME = "instagram"
 
-    # Instagram private API endpoints
-    CURRENT_USER_URL = "https://i.instagram.com/api/v1/accounts/current_user/?edit=true"
-    MEDIA_CONFIGURE_URL = "https://i.instagram.com/api/v1/media/configure/"
+    # Instagram check endpoints
+    CHECK_URL = "https://www.instagram.com/"
+    MOBILE_CHECK_URL = "https://www.instagram.com/accounts/edit/"
 
     async def live_check(self, client: httpx.AsyncClient, cookies: Dict[str, str]) -> Dict[str, Any]:
         """Instagram cookie se check karo ki account working hai ya dead."""
@@ -26,35 +27,48 @@ class InstagramPlatform(BasePlatform):
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
         headers = {
-            "User-Agent": "Instagram 269.0.0.19.107 Android (24/7.0; 480dpi; 1080x1920; samsung; SM-G973F; beyond1; qcom; en_US; 314675575)",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Cookie": cookie_header,
-            "Accept": "*/*",
-            "X-IG-App-ID": "936619743392459",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
         }
 
         try:
-            r = await client.get(self.CURRENT_USER_URL, headers=headers)
+            r = await client.get(self.CHECK_URL, headers=headers)
 
             if r.status_code == 200:
-                try:
-                    data = r.json()
-                    user = data.get("user", {}) if isinstance(data, dict) else {}
-                    if user.get("pk") or user.get("username"):
-                        return {
-                            "Status": "LIVE",
-                            "Platform": "instagram",
-                            "ig_id": str(user.get("pk", "")),
-                            "username": user.get("username", ""),
-                            "full_name": user.get("full_name", ""),
-                            "Reason": "",
-                        }
-                except Exception:
-                    pass
+                html = r.text
+
+                # Check if redirected to login (cookie dead)
+                if "login" in r.url.lower() or '"is_logged_in":false' in html:
+                    return {
+                        "Status": "DEAD",
+                        "Platform": "instagram",
+                        "Reason": "redirected to login or not logged in",
+                    }
+
+                # Try to extract username from page
+                uname_match = re.search(
+                    r'"username"\s*:\s*"([^"]+)"', html
+                )
+                username = uname_match.group(1) if uname_match else ""
+
                 return {
-                    "Status": "UNKNOWN",
+                    "Status": "LIVE",
                     "Platform": "instagram",
-                    "Reason": "non-json response",
+                    "username": username,
+                    "ig_id": "",
+                    "Reason": "",
                 }
+
+            if r.status_code in (302, 301):
+                location = r.headers.get("location", "")
+                if "login" in location.lower() or "accounts/login" in location.lower():
+                    return {
+                        "Status": "DEAD",
+                        "Platform": "instagram",
+                        "Reason": "login redirect",
+                    }
 
             if r.status_code in (401, 403):
                 return {
@@ -89,24 +103,25 @@ class InstagramPlatform(BasePlatform):
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
         headers = {
-            "User-Agent": "Instagram 269.0.0.19.107 Android (24/7.0; 480dpi; 1080x1920; samsung; SM-G973F; beyond1; qcom; en_US; 314675575)",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Cookie": cookie_header,
             "Content-Type": "application/x-www-form-urlencoded",
-            "X-IG-App-ID": "936619743392459",
+            "Origin": "https://www.instagram.com",
+            "Referer": "https://www.instagram.com/",
         }
 
-        payload = {"caption": text}
+        payload = {
+            "caption": text,
+        }
 
         try:
-            r = await client.post(self.MEDIA_CONFIGURE_URL, headers=headers, data=payload)
+            r = await client.post(
+                "https://www.instagram.com/api/v1/web/posts/create/",
+                headers=headers,
+                data=payload,
+            )
 
             if r.status_code == 200:
-                try:
-                    data = r.json()
-                    media_id = data.get("media", {}).get("pk") if isinstance(data, dict) else None
-                    return True, str(media_id) if media_id else None, None
-                except Exception:
-                    pass
                 return True, None, None
 
             if r.status_code == 429:

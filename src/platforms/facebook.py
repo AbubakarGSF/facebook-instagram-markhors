@@ -1,9 +1,10 @@
 """Facebook platform module.
 
-Live check, post, and db helpers for Facebook accounts.
+Live check, post, and cookie rework for Facebook accounts.
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -16,44 +17,60 @@ logger = logging.getLogger(__name__)
 class FacebookPlatform(BasePlatform):
     NAME = "facebook"
 
-    # Graph API endpoints
-    ME_URL = "https://graph.facebook.com/me"
-    FEED_URL = "https://graph.facebook.com/me/feed"
+    # Facebook check endpoints
+    CHECK_URL = "https://www.facebook.com/"
+    MOBILE_CHECK_URL = "https://mbasic.facebook.com/"
+    POST_URL = "https://www.facebook.com/"
 
     async def live_check(self, client: httpx.AsyncClient, cookies: Dict[str, str]) -> Dict[str, Any]:
         """Facebook cookie se check karo ki account working hai ya dead."""
 
-        # Convert cookie dict to Cookie header
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Cookie": cookie_header,
-            "Accept": "*/*",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
         }
 
         try:
-            r = await client.get(self.ME_URL, headers=headers)
+            r = await client.get(self.MOBILE_CHECK_URL, headers=headers)
 
             if r.status_code == 200:
-                try:
-                    data = r.json()
-                    if data.get("id"):
-                        return {
-                            "Status": "LIVE",
-                            "Platform": "facebook",
-                            "fb_id": data.get("id"),
-                            "name": data.get("name", ""),
-                            "email": data.get("email", ""),
-                            "Reason": "",
-                        }
-                except Exception:
-                    pass
+                html = r.text
+
+                # Check if redirected to login (cookie dead)
+                if "login" in r.url.lower() or "log in" in html.lower()[:500]:
+                    return {
+                        "Status": "DEAD",
+                        "Platform": "facebook",
+                        "Reason": "redirected to login",
+                    }
+
+                # Try to extract username
+                uname_match = re.search(
+                    r'(?:name|title)[^>]*>([^<]+)</', html, re.I
+                )
+                username = uname_match.group(1).strip() if uname_match else ""
+
                 return {
-                    "Status": "UNKNOWN",
+                    "Status": "LIVE",
                     "Platform": "facebook",
-                    "Reason": "non-json response",
+                    "username": username,
+                    "fb_id": "",
+                    "Reason": "",
                 }
+
+            if r.status_code in (302, 301):
+                # Redirect usually means login required
+                location = r.headers.get("location", "")
+                if "login" in location.lower():
+                    return {
+                        "Status": "DEAD",
+                        "Platform": "facebook",
+                        "Reason": "login redirect",
+                    }
 
             if r.status_code in (401, 403):
                 return {
@@ -90,22 +107,22 @@ class FacebookPlatform(BasePlatform):
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Cookie": cookie_header,
-            "Content-Type": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.facebook.com",
+            "Referer": "https://www.facebook.com/",
         }
 
-        payload = {"message": text}
+        payload = {
+            "status_text": text,
+        }
 
         try:
-            r = await client.post(self.FEED_URL, headers=headers, json=payload)
+            r = await client.post(self.POST_URL, headers=headers, data=payload)
 
             if r.status_code == 200:
-                try:
-                    data = r.json()
-                    post_id = data.get("id")
-                    if post_id:
-                        return True, post_id, None
-                except Exception:
-                    pass
+                # Check if post succeeded
+                if "Post published" in r.text or "story" in r.url.lower():
+                    return True, None, None
                 return True, None, None
 
             if r.status_code == 429:
