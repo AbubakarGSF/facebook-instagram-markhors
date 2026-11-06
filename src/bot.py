@@ -15,6 +15,7 @@ import time
 import zipfile as _zipfile
 from typing import Dict, List, Optional
 
+import filetype
 import httpx
 
 from telegram import Update
@@ -27,6 +28,7 @@ from src.platforms.facebook import FacebookPlatform
 from src.platforms.instagram import InstagramPlatform
 from src.utils.crypto import decrypt_cookies, encrypt_cookies
 from src.utils.proxy import load_proxies, proxy_status_text, norm_proxy
+from src.utils.ratelimit import rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,28 @@ _ig_platform: Optional[InstagramPlatform] = None
 user_state: Dict[int, dict] = {}
 CAMPS: Dict[int, dict] = {}
 CAMPRUN: Dict[int, dict] = {}
+
+# User state TTL (minutes) - clean up old state entries
+USER_STATE_TTL_MIN = int(os.getenv("USER_STATE_TTL_MIN", "30"))
+
+
+def cleanup_user_state():
+    """Remove expired entries from user_state and CAMPS."""
+    now = time.time()
+    ttl = USER_STATE_TTL_MIN * 60
+    expired = [uid for uid, st in user_state.items() if now - st.get("at", now) > ttl]
+    for uid in expired:
+        user_state.pop(uid, None)
+
+    # Also clean up old campaign configs (not running campaigns)
+    expired_camps = [
+        uid for uid, cfg in CAMPS.items()
+        if now - cfg.get("stage_at", now) > ttl and uid not in CAMPRUN
+    ]
+    for uid in expired_camps:
+        CAMPS.pop(uid, None)
+
+    return len(expired) + len(expired_camps)
 
 
 def init_db(url: str, key: str) -> Optional[SupabaseDB]:
@@ -214,7 +238,7 @@ async def netcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user_state[uid] = {"mode": "rework", "platform": None}
+    user_state[uid] = {"mode": "rework", "platform": None, "at": time.time()}
     await update.message.reply_text(
         "Mode = rework. Ab cookie .txt bhejo.\n"
         "Supported formats:\n"
@@ -229,7 +253,7 @@ async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user_state[uid] = {"mode": "verify"}
+    user_state[uid] = {"mode": "verify", "at": time.time()}
     await update.message.reply_text(
         "Mode = verify. Ab cookie zip bhejo.\n"
         "Supported formats:\n"
@@ -248,10 +272,12 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if val in ("on", "1", "yes"):
         user_state[uid] = user_state.get(uid, {})
         user_state[uid]["live"] = True
+        user_state[uid]["at"] = time.time()
         await update.message.reply_text("Live = ON")
     elif val in ("off", "0", "no"):
         user_state[uid] = user_state.get(uid, {})
         user_state[uid]["live"] = False
+        user_state[uid]["at"] = time.time()
         await update.message.reply_text("Live = OFF")
     else:
         await update.message.reply_text("Usage: /live on|off")
@@ -268,7 +294,6 @@ async def db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("SUPABASE_URL / KEY set nahi.")
         return
 
-    import httpx
     async with httpx.AsyncClient() as cl:
         if sub == "stats":
             fb_count = await _db.count(cl, "fb_accounts")
@@ -437,7 +462,7 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cfg["stage"] = "cookies"
         cfg["stage_at"] = time.time()
         save_camp(uid)
-        user_state[uid] = {"mode": "campaign", "platform": cfg["platform"]}
+        user_state[uid] = {"mode": "campaign", "platform": cfg["platform"], "at": time.time()}
         await update.message.reply_text(
             "Ab cookie zip bhejo (campaign ke liye)."
         )
@@ -583,11 +608,24 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("File process ho rahi hai...")
 
+    # Clean up expired user state entries
+    cleanup_user_state()
+
     tmp = tempfile.mkdtemp(prefix="sm_")
     try:
         file = await context.bot.get_file(doc.file_id)
         path = os.path.join(tmp, doc.file_name)
         await file.download_to_drive(path)
+
+        # MIME type validation using filetype (pure Python, no libmagic needed)
+        kind = filetype.guess(path)
+        if kind is None:
+            await msg.edit_text("Invalid file type. Only .txt and .zip files are allowed.")
+            return
+        mime = kind.mime
+        if mime not in ("application/zip", "text/plain"):
+            await msg.edit_text("Invalid file type. Only .txt and .zip files are allowed.")
+            return
 
         results = []
 
@@ -698,6 +736,9 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
             await _db.upsert(cl, table, [row])
 
     return (name, output, status)
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user_state.pop(uid, None)
     await update.message.reply_text("Cancel / reset.")

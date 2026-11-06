@@ -36,9 +36,75 @@ from src.bot import (
     stopcamp_cmd,
     verify_cmd,
 )
+from src.utils.proxy import check_proxy_readiness
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+_health_server = None
+
+
+async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Simple HTTP health check endpoint."""
+    try:
+        data = await reader.read(1024)
+        if not data:
+            writer.close()
+            return
+        request_line = data.split(b"\n")[0].decode("utf-8", errors="ignore")
+        parts = request_line.split()
+        method = parts[0] if len(parts) > 0 else ""
+        path = parts[1] if len(parts) > 1 else ""
+
+        if method == "GET" and path == "/healthz":
+            body = b'{"status":"ok"}'
+            response = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+                + body
+            )
+        else:
+            response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
+        writer.write(response)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def start_health_server():
+    """Start HTTP health check server if HEALTH_CHECK_PORT is set."""
+    global _health_server
+    if HEALTH_CHECK_PORT <= 0:
+        return
+    try:
+        _health_server = await asyncio.start_server(
+            _health_handler, HEALTH_CHECK_HOST, HEALTH_CHECK_PORT
+        )
+        logger.info(f"Health check server on {HEALTH_CHECK_HOST}:{HEALTH_CHECK_PORT}")
+    except Exception:
+        logger.exception("Health check server failed to start")
+
+
+async def stop_health_server():
+    """Stop health check server."""
+    global _health_server
+    if _health_server is not None:
+        _health_server.close()
+        try:
+            await _health_server.wait_closed()
+        except Exception:
+            pass
+        _health_server = None
 
 
 async def post_init(app):
@@ -52,12 +118,28 @@ async def post_init(app):
     init_platforms()
     logger.info("Platforms initialized (Facebook, Instagram)")
 
+    # Check proxy readiness
+    proxy_warnings = check_proxy_readiness()
+    for w in proxy_warnings:
+        logger.warning(w)
+
+    # Start health check server
+    await start_health_server()
+
     if NETCHECK_ON_START:
         logger.info("Netcheck on start enabled")
 
 
 async def post_shutdown(app):
+    """Graceful shutdown: close health server, cancel running tasks."""
     logger.info("Bot shutting down...")
+
+    # Stop health server
+    await stop_health_server()
+
+    # Cancel running campaigns
+    for uid, state in CAMPRUN.items():
+        state["stop"] = True
 
 
 def main():

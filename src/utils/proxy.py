@@ -22,6 +22,30 @@ RUNTIME_PROXY_FILE = "proxies.txt"
 PROXY_DISABLED = False
 
 
+def check_socksio() -> bool:
+    """Check if socksio is installed for SOCKS5 proxy support."""
+    try:
+        import socksio
+        return True
+    except ImportError:
+        return False
+
+
+def check_proxy_readiness() -> List[str]:
+    """Check proxy configuration and return list of warnings."""
+    warnings = []
+
+    if PROXIES:
+        socks_proxies = [p for p in PROXIES if p.startswith("socks5")]
+        if socks_proxies and not check_socksio():
+            warnings.append(
+                "SOCKS5 proxies configured but 'socksio' not installed. "
+                "Install: pip install socksio"
+            )
+
+    return warnings
+
+
 def norm_proxy(raw: str, default_scheme: Optional[str] = None) -> Optional[str]:
     """Proxy line ko httpx-compatible URL mein convert karo."""
     s = (raw or "").strip().strip('"').strip("'").strip()
@@ -136,3 +160,14 @@ def proxy_status_text() -> str:
     lines = [f"Proxy: ON ({len(PROXIES)})", "Traffic only | Telegram + Supabase direct"]
     lines += [f"{i + 1}. {p}" for i, p in enumerate(PROXIES[:40])]
     return "\n".join(lines)
+
+
+def mask_sensitive(text: str) -> str:
+    """Mask sensitive data (cookie values, proxy credentials) in log messages."""
+    # Mask cookie values in URLs or strings
+    text = re.sub(r'(cookie=|Cookie:)[^;&\s]+', r'\1***masked***', text, flags=re.I)
+    # Mask proxy credentials (user:pass@host)
+    text = re.sub(r'://[^:@\s]+:[^:@\s]+@', r'://***:***@', text)
+    # Mask auth headers
+    text = re.sub(r'(authorization|authorization:)[^;\s\r\n]+', r'\1***masked***', text, flags=re.I)
+    return text
