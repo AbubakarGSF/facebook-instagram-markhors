@@ -685,6 +685,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Clean up expired user state entries
     cleanup_user_state()
 
+    # Check if proxies are configured - without them all traffic goes direct
+    if not PROXIES:
+        await msg.edit_text(
+            "⚠️ No proxies configured! All X traffic will go direct.\n"
+            "Add proxies with /proxy add before uploading cookies."
+        )
+
     tmp = tempfile.mkdtemp(prefix="sm_")
     try:
         file = await context.bot.get_file(doc.file_id)

@@ -37,7 +37,7 @@ from src.bot import (
     stopcamp_cmd,
     verify_cmd,
 )
-from src.utils.proxy import check_proxy_readiness
+from src.utils.proxy import check_proxy_readiness, load_proxies
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,7 +86,7 @@ from src.bot import (
     stopcamp_cmd,
     verify_cmd,
 )
-from src.utils.proxy import check_proxy_readiness
+from src.utils.proxy import check_proxy_readiness, load_proxies
 
 logging.basicConfig(
     level=logging.INFO,
@@ -106,7 +106,7 @@ def _is_admin_ip(host: str) -> bool:
 
 
 async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Simple HTTP health check endpoint."""
+    """Simple HTTP health check endpoint - localhost only."""
     try:
         data = await reader.read(1024)
         if not data:
@@ -117,15 +117,7 @@ async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWr
         method = parts[0] if len(parts) > 0 else ""
         path = parts[1] if len(parts) > 1 else ""
 
-        # Only allow localhost connections for health check
-        peername = writer.get_extra_info("peername")
-        host = peername[0] if peername else ""
-        if host not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
-            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
-            return
+        if method == "GET" and path == "/healthz":
             body = b'{"status":"ok"}'
             response = (
                 b"HTTP/1.1 200 OK\r\n"
@@ -137,6 +129,16 @@ async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWr
             )
         else:
             response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
+        # Only allow localhost connections for health check
+        peername = writer.get_extra_info("peername")
+        host = peername[0] if peername else ""
+        if host not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
+            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
 
         writer.write(response)
         await writer.drain()
@@ -186,6 +188,10 @@ async def post_init(app):
     # Initialize platforms
     init_platforms()
     logger.info("Platforms initialized (Facebook, Instagram)")
+
+    # Load proxies
+    proxy_count = len(load_proxies())
+    logger.info(f"Proxies loaded: {proxy_count}")
 
     # Check proxy readiness
     proxy_warnings = check_proxy_readiness()
