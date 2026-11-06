@@ -29,6 +29,7 @@ from src.bot import (
     init_platforms,
     live_cmd,
     netcheck_cmd,
+    on_text,
     proxy_cmd,
     rework_cmd,
     start,
@@ -48,6 +49,62 @@ logger = logging.getLogger(__name__)
 _health_server = None
 
 
+import asyncio
+import logging
+import sys
+
+from dotenv import load_dotenv
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+
+from config.settings import (
+    ADMIN_IDS,
+    BOT_TOKEN,
+    CREDIT,
+    HEALTH_CHECK_HOST,
+    HEALTH_CHECK_PORT,
+    NETCHECK_ON_START,
+    SUPABASE_KEY,
+    SUPABASE_URL,
+    WEBSITE,
+)
+from src.bot import (
+    cancel_cmd,
+    camp_cmd,
+    db_cmd,
+    diag_cmd,
+    handle_file,
+    help_cmd,
+    init_db,
+    init_platforms,
+    live_cmd,
+    netcheck_cmd,
+    on_text,
+    proxy_cmd,
+    rework_cmd,
+    start,
+    status_cmd,
+    stopcamp_cmd,
+    verify_cmd,
+)
+from src.utils.proxy import check_proxy_readiness
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": "%(message)s"}',
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+_health_server = None
+
+
+def _is_admin_ip(host: str) -> bool:
+    """Check if request comes from localhost or admin IP."""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return True
+    return False
+
+
 async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Simple HTTP health check endpoint."""
     try:
@@ -60,7 +117,15 @@ async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWr
         method = parts[0] if len(parts) > 0 else ""
         path = parts[1] if len(parts) > 1 else ""
 
-        if method == "GET" and path == "/healthz":
+        # Only allow localhost connections for health check
+        peername = writer.get_extra_info("peername")
+        host = peername[0] if peername else ""
+        if host not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
+            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
             body = b'{"status":"ok"}'
             response = (
                 b"HTTP/1.1 200 OK\r\n"
@@ -185,6 +250,10 @@ def main():
     # Document handler for cookie file uploads
     app.add_handler(
         MessageHandler(filters.Document.ALL, handle_file)
+    )
+    # Text handler for campaign text collection
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, on_text)
     )
 
     logger.info("Social Markhors Bot running | admins: %s", len(ADMIN_IDS))

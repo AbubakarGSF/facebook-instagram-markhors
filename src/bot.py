@@ -381,6 +381,9 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid not in ADMIN_IDS:
         await update.message.reply_text("Sirf admin.")
         return
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
 
     args = context.args
     sub = args[0].lower() if args else ""
@@ -545,6 +548,9 @@ async def stopcamp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
         await update.message.reply_text("Sirf admin.")
+        return
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
     if uid in CAMPRUN:
         CAMPRUN[uid]["stop"] = True
@@ -810,5 +816,34 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
     user_state.pop(uid, None)
     await update.message.reply_text("Cancel / reset.")
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages for campaign variant collection."""
+    uid = update.effective_user.id
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
+
+    state = user_state.get(uid, {})
+    if not state or state.get("mode") != "campaign" or state.get("stage") != "text":
+        return
+
+    cfg = CAMPS.get(uid)
+    if not cfg:
+        await update.message.reply_text("Campaign not found. Use /camp new to create one.")
+        return
+
+    text = safe_text(update.message.text or "", max_len=4096)
+    if not text:
+        await update.message.reply_text("Empty text not allowed.")
+        return
+
+    cfg["texts"].append(text)
+    save_camp(uid)
+    await update.message.reply_text(f"Variant {len(cfg['texts'])} added: {safe_text(text, 80)}...")

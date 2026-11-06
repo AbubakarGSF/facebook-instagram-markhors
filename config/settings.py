@@ -2,6 +2,7 @@
 
 import logging
 import os
+import sys
 from typing import Set
 
 
@@ -50,8 +51,10 @@ BOT_VERSION = "2.0.0"
 # Encryption key for cookie storage at rest
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
 if not ENCRYPTION_KEY:
-    logger.warning(
-        "ENCRYPTION_KEY not set - cookies will be stored in plaintext. "
-        "Generate one with: python -c \"from cryptography.fernet import Fernet; "
+    logger.critical(
+        "ENCRYPTION_KEY env var is REQUIRED but not set. "
+        "Cookies cannot be encrypted at rest. Generate one with: "
+        "python -c \"from cryptography.fernet import Fernet; "
         "print(Fernet.generate_key().decode())\""
     )
+    sys.exit(1)
