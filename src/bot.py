@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import tempfile
 import time
@@ -27,7 +28,7 @@ from src.platforms.base import BasePlatform
 from src.platforms.facebook import FacebookPlatform
 from src.platforms.instagram import InstagramPlatform
 from src.utils.crypto import decrypt_cookies, encrypt_cookies
-from src.utils.proxy import load_proxies, proxy_status_text, norm_proxy
+from src.utils.proxy import load_proxies, proxy_status_text, norm_proxy, mask_sensitive
 from src.utils.ratelimit import rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,9 @@ CAMPRUN: Dict[int, dict] = {}
 
 # User state TTL (minutes) - clean up old state entries
 USER_STATE_TTL_MIN = int(os.getenv("USER_STATE_TTL_MIN", "30"))
+
+# Per-user command rate limiting (seconds between commands)
+USER_CMD_COOLDOWN = float(os.getenv("USER_CMD_COOLDOWN", "2.0"))
 
 
 def cleanup_user_state():
@@ -158,9 +162,42 @@ class _nullzip:
             return f.read()
 
 
+def safe_zip_entry_name(name: str) -> str:
+    """Sanitize zip entry name to prevent path traversal (zip slip)."""
+    # Only use the basename - strips any directory components
+    return os.path.basename(name.replace("\\", "/"))
+
+
+def safe_text(text: str, max_len: int = 4096) -> str:
+    """Sanitize text input - strip dangerous characters and limit length."""
+    if not text:
+        return ""
+    # Remove control characters except newline/tab
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    # Limit length
+    if len(text) > max_len:
+        text = text[:max_len] + "..."
+    return text
+
+
+def check_user_rate_limit(uid: int) -> bool:
+    """Check if user is rate limited. Returns True if allowed, False if rate limited."""
+    now = time.time()
+    last = user_state.get(uid, {}).get("last_cmd", 0)
+    if now - last < USER_CMD_COOLDOWN:
+        return False
+    user_state[uid] = user_state.get(uid, {})
+    user_state[uid]["last_cmd"] = now
+    return True
+
+
 # ============================ BASIC HANDLERS ============================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
     await update.message.reply_text(
         "Social Markhors Bot\n\n"
         "Platforms: Facebook, Instagram\n\n"
@@ -174,6 +211,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
     await update.message.reply_text(
         "REWORK: /rework > cookie .txt bhejo\n"
         "Supported formats:\n"
@@ -194,6 +235,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
     fb = "ON" if _fb_platform else "OFF"
     ig = "ON" if _ig_platform else "OFF"
     await update.message.reply_text(
@@ -211,6 +255,9 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Sirf admin.")
         return
+    if not check_user_rate_limit(update.effective_user.id):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
     await update.message.reply_text(
         f"diag: system ok\n"
         f"fb_platform: {'ok' if _fb_platform else 'none'}\n"
@@ -223,12 +270,18 @@ async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Sirf admin.")
         return
+    if not check_user_rate_limit(update.effective_user.id):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
     await update.message.reply_text(proxy_status_text())
 
 
 async def netcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Sirf admin.")
+        return
+    if not check_user_rate_limit(update.effective_user.id):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
     await update.message.reply_text(
         "Netcheck: Facebook + Instagram + Supabase reachability test\n"
@@ -238,6 +291,9 @@ async def netcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
     user_state[uid] = {"mode": "rework", "platform": None, "at": time.time()}
     await update.message.reply_text(
         "Mode = rework. Ab cookie .txt bhejo.\n"
@@ -253,6 +309,9 @@ async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
     user_state[uid] = {"mode": "verify", "at": time.time()}
     await update.message.reply_text(
         "Mode = verify. Ab cookie zip bhejo.\n"
@@ -264,6 +323,9 @@ async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /live on|off")
@@ -286,6 +348,9 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Sirf admin.")
+        return
+    if not check_user_rate_limit(update.effective_user.id):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
     args = context.args
     sub = args[0].lower() if args else "stats"
@@ -349,7 +414,7 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sub == "new":
         cfg = new_camp()
-        cfg["name"] = (" ".join(args[1:]) or "camp")[:40]
+        cfg["name"] = safe_text((" ".join(args[1:]) or "camp"), 40)
         CAMPS[uid] = cfg
         save_camp(uid)
         await update.message.reply_text(
@@ -445,7 +510,7 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Pehle text variants bhejo.")
             return
         for i, t in enumerate(cfg["texts"][:5]):
-            await update.message.reply_text(f"Variant {i+1}: {t}")
+            await update.message.reply_text(f"Variant {i+1}: {safe_text(t, 4096)}")
         return
 
     if sub == "start":
@@ -478,6 +543,9 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stopcamp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await update.message.reply_text("Sirf admin.")
+        return
     if uid in CAMPRUN:
         CAMPRUN[uid]["stop"] = True
         await update.message.reply_text("Stop - current account ke baad rukega.")
@@ -537,7 +605,7 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
             return
 
         # Check filters
-        username = check.get("username", "")
+        username = safe_text(check.get("username", ""))
         country = check.get("country", "")
         followers = int(check.get("Followers", 0) or 0)
 
@@ -548,7 +616,7 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
 
         # Post
         text = random.choice(texts)
-        ok, post_id, err = await platform_obj.post(cl, ck, text)
+        ok, post_id, err = await platform_obj.post(cl, ck, safe_text(text))
 
         if ok:
             posted_count += 1
@@ -666,7 +734,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with _zipfile.ZipFile(out_path, "w", _zipfile.ZIP_DEFLATED) as zout:
                 for name, output, status in results:
                     folder = "working" if status == "LIVE" else ("dead" if status == "DEAD" else "unknown")
-                    zout.writestr(f"{folder}/{name}", output)
+                    # Path traversal protection: use basename only
+                    safe_name = safe_zip_entry_name(name)
+                    zout.writestr(f"{folder}/{safe_name}", output)
 
             await context.bot.send_document(
                 update.effective_chat.id,
