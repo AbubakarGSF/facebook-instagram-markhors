@@ -1082,6 +1082,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await reporter.update(0, progress_counts, last="shuru ho raha hai...", force=True)
                 for i, name in enumerate(names, 1):
+                    await reporter.update(
+                        i - 1,
+                        progress_counts,
+                        current=safe_zip_entry_name(name),
+                        last="checking...",
+                    )
                     raw = z.read(name).decode("utf-8", "ignore")
                     try:
                         result = await _process_one(name, raw, state)
