@@ -3,4 +3,3 @@ httpx[socks]==0.28.1
 python-dotenv==1.0.1
 cryptography==50.0.1
 socksio==1.0.0
-filetype==1.2.0
