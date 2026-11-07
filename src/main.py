@@ -2,56 +2,11 @@
 
 import asyncio
 import logging
+import os
 import sys
 
-from dotenv import load_dotenv
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
-
-from config.settings import (
-    ADMIN_IDS,
-    BOT_TOKEN,
-    CREDIT,
-    HEALTH_CHECK_HOST,
-    HEALTH_CHECK_PORT,
-    NETCHECK_ON_START,
-    SUPABASE_KEY,
-    SUPABASE_URL,
-    WEBSITE,
-)
-from src.bot import (
-    cancel_cmd,
-    camp_cmd,
-    db_cmd,
-    diag_cmd,
-    handle_file,
-    help_cmd,
-    init_db,
-    init_platforms,
-    live_cmd,
-    netcheck_cmd,
-    on_text,
-    proxy_cmd,
-    rework_cmd,
-    start,
-    status_cmd,
-    stopcamp_cmd,
-    verify_cmd,
-)
-from src.utils.proxy import check_proxy_readiness, load_proxies
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": "%(message)s"}',
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-logger = logging.getLogger(__name__)
-
-_health_server = None
-
-
-import asyncio
-import logging
-import sys
+# Add project root to path so config package can be found
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
