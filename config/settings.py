@@ -5,6 +5,8 @@ import os
 import sys
 from typing import Set
 
+logger = logging.getLogger(__name__)
+
 
 def _env_list(name: str, default: str = "") -> Set[int]:
     raw = os.getenv(name, default).strip()
