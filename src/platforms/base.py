@@ -21,7 +21,12 @@ SKIP_KEYS = {
     "domain", "path", "expires", "max-age", "secure", "httponly",
     "samesite", "status", "username", "name", "id", "country",
     "followers", "friends", "posts", "likes", "media", "verified",
-    "email", "phone", "platform", "checked", "reason", "via",
+    "email", "phone", "platform", "platform source", "checked", "reason",
+    "via", "access_token", "accesstoken", "token", "bearer", "api",
+    "api_key", "apikey", "developer api", "password", "passwd", "pwd",
+    "2fa", "twofa", "card", "card added", "business", "marketplace",
+    "year", "created", "suspended", "protected", "verified type",
+    "homepage", "website", "url", "link", "source", "note", "notes",
 }
 
 
@@ -114,7 +119,10 @@ class BasePlatform:
                 continue
             if k.lower() in SKIP_KEYS:
                 continue
-            if sep == ":" and (v.startswith("//") or " " in v):
+            # `Homepage: https://...` jaisi metadata lines cookie nahi hotin.
+            if sep == ":" and (
+                v.startswith(("//", "http://", "https://")) or " " in v
+            ):
                 continue
             seen.add(k)
             data[k] = v

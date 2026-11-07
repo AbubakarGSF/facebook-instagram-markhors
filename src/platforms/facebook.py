@@ -95,6 +95,10 @@ class FacebookPlatform(BasePlatform):
                         if m:
                             fb_id = m.group(1)
                             break
+                    # Cookies me c_user hamesha hota hai — HTML se id na mile
+                    # to bhi DB row ke liye reliable id mil jati hai.
+                    if not fb_id:
+                        fb_id = str(cookies.get("c_user") or "")
 
                     return {
                         "Status": "LIVE",
@@ -128,11 +132,19 @@ class FacebookPlatform(BasePlatform):
                         "Reason": "login redirect",
                     }
 
-            if r.status_code in (401, 403):
+            if r.status_code == 401:
                 return {
                     "Status": "DEAD",
                     "Platform": "facebook",
-                    "Reason": "auth failed (401/403)",
+                    "Reason": "auth failed (401)",
+                }
+            if r.status_code == 403:
+                # 403 aksar IP/region block ya checkpoint hota hai; cookie
+                # dead hone ka proof nahi. False DEAD se bachne ke liye UNKNOWN.
+                return {
+                    "Status": "UNKNOWN",
+                    "Platform": "facebook",
+                    "Reason": "HTTP 403 (IP/checkpoint block ho sakta hai)",
                 }
 
             return {

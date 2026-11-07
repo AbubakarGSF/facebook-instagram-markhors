@@ -54,3 +54,32 @@ def test_norm_proxy_empty():
     assert norm_proxy("# comment") is None
     assert norm_proxy("") is None
     assert norm_proxy("not-a-proxy") is None
+
+
+def test_norm_proxy_rejects_unsupported_and_malformed():
+    """Unknown schemes / empty hosts must not silently become valid proxies."""
+    assert norm_proxy("socks4://1.2.3.4:1080") is None
+    assert norm_proxy("socks4a://1.2.3.4:1080") is None
+    assert norm_proxy("http://") is None
+    assert norm_proxy("://bad") is None
+
+
+def test_norm_proxy_bracketed_ipv6_without_auth():
+    """Bracketed IPv6 must stay bracketed in the output URL."""
+    assert norm_proxy("[2001:db8::1]:1080") == "http://[2001:db8::1]:1080"
+    assert (
+        norm_proxy("socks5://[2001:db8::1]:1080")
+        == "socks5://[2001:db8::1]:1080"
+    )
+
+
+def test_norm_proxy_trailing_slash():
+    assert norm_proxy("http://1.2.3.4:8080/") == "http://1.2.3.4:8080"
+
+
+def test_mask_sensitive_hides_bare_credentials():
+    from src.utils.proxy import mask_sensitive
+
+    masked = mask_sensitive("connect user:supersecret@1.2.3.4:1080 failed")
+    assert "supersecret" not in masked
+    assert "***:***@" in masked

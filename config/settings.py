@@ -81,7 +81,7 @@ VERIFY_CONFIRM_DEAD = os.getenv("VERIFY_CONFIRM_DEAD", "1").strip().lower() in (
 )
 
 # Bot version
-BOT_VERSION = "2.3.2"
+BOT_VERSION = "2.3.3"
 
 # Encryption key for cookie storage at rest
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")

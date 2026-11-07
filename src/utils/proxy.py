@@ -15,7 +15,10 @@ import httpx
 logger = logging.getLogger(__name__)
 
 PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
-PROXY_UNSUPPORTED = ("vless", "vmess", "trojan", "ss", "shadowsocks", "hysteria", "hysteria2", "tuic", "wireguard", "wg", "ssh", "ftp")
+PROXY_UNSUPPORTED = (
+    "vless", "vmess", "trojan", "ss", "shadowsocks", "hysteria", "hysteria2",
+    "tuic", "wireguard", "wg", "ssh", "ftp", "socks4", "socks4a",
+)
 
 PROXIES: List[str] = []
 PROXY_SKIPPED: List[str] = []
@@ -48,60 +51,81 @@ def check_proxy_readiness() -> List[str]:
     return warnings
 
 
+def _snippet(raw: str) -> str:
+    """Log-safe proxy snippet (credentials masked)."""
+    return mask_sensitive(str(raw or ""))[:120]
+
+
 def norm_proxy(raw: str, default_scheme: Optional[str] = None) -> Optional[str]:
-    """Proxy line ko httpx-compatible URL mein convert karo."""
+    """Proxy line ko httpx-compatible URL mein convert karo.
+
+    Invalid / unsupported schemes are rejected explicitly. Pehle `socks4://`
+    jaisa scheme chup-chaap `http://socks4//host` ban jata tha aur har verify
+    fail hota tha — ab aisa entry load hi nahi hoti.
+    """
     s = (raw or "").strip().strip('"').strip("'").strip()
     if not s or s.startswith("#"):
         return None
 
-    low = s.lower()
-    for bad in PROXY_UNSUPPORTED:
-        if low.startswith(bad + "://"):
-            logger.warning("proxy skip: %s:// httpx support nahi karta", bad)
-            PROXY_SKIPPED.append(bad)
-            return None
-
     scheme, body = None, s
-    m = re.match(r"^(socks5h|socks5|socks|https|http)\s*(?::\/\/|\||:)\s*(.*)$", s, re.I)
-    if m and m.group(2):
+    m = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*)://(.*)$", s)
+    if m:
         scheme = m.group(1).lower()
+        body = m.group(2).strip()
         if scheme == "socks":
             scheme = "socks5"
-        body = m.group(2)
-
-    if scheme is None:
-        scheme = (default_scheme or os.getenv("PROXY_TYPE", "http")).lower()
         if scheme not in PROXY_SCHEMES:
-            scheme = "http"
+            logger.warning("proxy skip: %s:// httpx support nahi karta", scheme)
+            PROXY_SKIPPED.append(scheme)
+            return None
+        if not body:
+            logger.warning("proxy invalid (empty): %s", _snippet(s))
+            return None
+    else:
+        # scheme|host... / scheme:host... (sirf known scheme prefixes)
+        m = re.match(r"^(socks5h|socks5|socks|https|http)\s*(?:\||:)\s*(.+)$", s, re.I)
+        if m and m.group(2).strip():
+            scheme = m.group(1).lower()
+            if scheme == "socks":
+                scheme = "socks5"
+            body = m.group(2).strip()
+        else:
+            scheme = (default_scheme or os.getenv("PROXY_TYPE", "http")).lower()
+            if scheme == "socks":
+                scheme = "socks5"
+            if scheme not in PROXY_SCHEMES:
+                scheme = "http"
+            body = s
+
+    if not body:
+        logger.warning("proxy invalid (empty): %s", _snippet(s))
+        return None
 
     if "@" in body:
         norm = _norm_auth_host(body)
         if not norm:
-            logging.warning("proxy invalid: %s", s)
+            logger.warning("proxy invalid: %s", _snippet(s))
             return None
         auth, hostpart = norm
-        s = scheme + "://" + auth + "@" + hostpart
-    elif "/" in body:
-        s = scheme + "://" + body
+        url = scheme + "://" + auth + "@" + hostpart
     else:
-        parts = _colon_proxy_parts(body)
+        parts = _colon_proxy_parts(body.rstrip("/"))
         if not parts:
-            logging.warning("proxy invalid (host:port chahiye): %s", s)
+            logger.warning("proxy invalid (host:port chahiye): %s", _snippet(s))
             return None
         host, port, user, pwd = parts
-        auth = ""
-        if user or pwd:
-            auth = user + ":" + pwd + "@"
-        s = scheme + "://" + auth + host + ":" + port
+        host_fmt = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        auth = user + ":" + pwd + "@" if (user or pwd) else ""
+        url = scheme + "://" + auth + host_fmt + ":" + port
 
     try:
-        p = httpx.URL(s)
+        p = httpx.URL(url)
     except Exception:
-        logging.warning("proxy invalid: %s", s)
+        logger.warning("proxy invalid: %s", _snippet(url))
         return None
 
     if p.scheme not in PROXY_SCHEMES or not p.host:
-        logging.warning("proxy skip: %s", s)
+        logger.warning("proxy skip: %s", _snippet(url))
         return None
 
     return str(p)
@@ -246,6 +270,8 @@ def add_proxy(entry: str) -> Tuple[bool, str]:
     url = norm_proxy(entry)
     if not url:
         return False, "invalid proxy format"
+    if not PROXIES:
+        load_proxies()
     if url in PROXIES:
         return True, url
     try:
@@ -281,10 +307,14 @@ async def test_proxies(limit: int = 10) -> List[str]:
 
 def mask_sensitive(text: str) -> str:
     """Mask sensitive data (cookie values, proxy credentials) in log messages."""
+    if not text:
+        return text
     # Mask cookie values in URLs or strings
     text = re.sub(r'(cookie=|Cookie:)[^;&\s]+', r'\1***masked***', text, flags=re.I)
-    # Mask proxy credentials (user:pass@host)
-    text = re.sub(r'://[^:@\s]+:[^:@\s]+@', r'://***:***@', text)
+    # Mask credentials inside full URLs (scheme://user:pass@host)
+    text = re.sub(r'://[^:@\s/]+:[^:@\s/]+@', r'://***:***@', text)
+    # Mask bare credentials (user:pass@host, no scheme)
+    text = re.sub(r'(?<![\w:/])([^\s:@/]+):([^\s@/]+)@', r'***:***@', text)
     # Mask auth headers
     text = re.sub(r'(authorization|authorization:)[^;\s\r\n]+', r'\1***masked***', text, flags=re.I)
     return text

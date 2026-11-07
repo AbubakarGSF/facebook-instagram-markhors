@@ -37,8 +37,10 @@ PROXY_TYPE=socks5
 ```
 
 Optional: `HEALTH_CHECK_PORT` / Railway `PORT`, `CONCURRENCY`, `TIMEOUT`,
-`ACC_TIMEOUT`, `MAX_FILES`, `VERIFY_SLOW_RETRY_SEC`, `VERIFY_CONFIRM_DEAD`,
-`PROGRESS_UPDATE_SEC`, `NETCHECK_ON_START`, `STATE_DIR`, `ZIP_MAX_*`.
+`ACC_TIMEOUT`, `MAX_FILES`, `FILE_TIMEOUT`, `CONTENT_COOLDOWN`,
+`VERIFY_SLOW_RETRY_SEC`, `VERIFY_CONFIRM_DEAD`, `PROGRESS_UPDATE_SEC`,
+`NETCHECK_ON_START`, `STATE_DIR`, `ZIP_MAX_*`, `IG_MEDIA_POLLS`,
+`IG_MEDIA_POLL_SEC`.
 
 `ENCRYPTION_KEY` generate karne ke liye:
 
@@ -57,7 +59,9 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 **Campaign**
 - `/camp new <name>` → `/camp platform facebook|instagram`
 - `/camp text` → variants bhejo → `/camp idle`
-- `/camp media`, `/camp filter country PK,US|followers 500`, `/camp delay 45-110`
+- `/camp media`, `/camp mediaurl https://public/image.jpg`, `/camp mediaclear`
+- `/camp filter country PK,US | year 2015,2016 | followers 500`
+- `/camp delay 45-110`
 - `/camp limit 50`, `/camp dry`, `/camp source zip|db`, `/camp preview`
 - `/camp tag #EvilMarkhors`, `/camp branding on|off`
 - `/camp start`, `/camp reset`, `/stopcamp`
@@ -99,6 +103,18 @@ verify nahi hoti — status `UNKNOWN` milta hai (false `DEAD` nahi). Is liye
 `1.txt`, numeric user-id files aur galat naam wali files bhi sahi site se
 check hoti hain.
 
+### Accuracy guards (false DEAD se bachao)
+
+- Proxy se `DEAD` aaye aur direct route confirm na kare to result `UNKNOWN`.
+- FB/IG `403` (IP/checkpoint block) → `UNKNOWN`, `401` → `DEAD`.
+- IG empty `200` → `UNKNOWN`; sirf explicit `login_required` / challenge → `DEAD`.
+- Missing session key wali file network par nahi jati — seedha `UNKNOWN`.
+- File ka processing time `FILE_TIMEOUT` se capped hai; hang hone par file
+  `errors/` me jati hai aur baqi processing chalti rehti hai.
+
+DB row ke liye owner id session cookie se bhi li jati hai (`c_user` FB,
+`ds_user_id` IG) — HTML metadata na mile to bhi row skip nahi hoti.
+
 ## DB behaviour (important)
 
 - Verify ke baad **LIVE, DEAD aur UNKNOWN teeno** rows insert/update hoti hain.
@@ -114,8 +130,12 @@ Cookie-only posting reliable nahi hai, is liye bot jhoot nahi bolta:
 - **Facebook**: Graph API `access_token` chahiye. Token na ho to result `UNSUPPORTED`.
 - **Instagram**: `access_token` + IG business id + **public image URL** chahiye
   (Graph API text-only post support nahi karta). Warna `UNSUPPORTED`.
+  Public URL `/camp mediaurl https://public/image.jpg` se set hota hai; media
+  container ready hone ka wait (`IG_MEDIA_POLLS` / `IG_MEDIA_POLL_SEC`) phir
+  publish hota hai.
 - Campaign summary me `Unsupported (token/media missing)` alag count hota hai,
   failed posts me mix nahi hota.
+- Per-account `media_url` campaign-level URL ko override karta hai.
 
 ## Run
 

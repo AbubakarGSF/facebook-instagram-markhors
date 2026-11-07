@@ -3,7 +3,9 @@
 Live check, post, and cookie rework for Instagram accounts.
 """
 
+import asyncio
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
@@ -74,7 +76,12 @@ class InstagramPlatform(BasePlatform):
                         "Status": "LIVE",
                         "Platform": "instagram",
                         "username": str(user.get("username") or ""),
-                        "ig_id": str(user.get("pk") or user.get("pk_id") or ""),
+                        "ig_id": str(
+                            user.get("pk")
+                            or user.get("pk_id")
+                            or cookies.get("ds_user_id")
+                            or ""
+                        ),
                         "fb_id": "",
                         "followers": user.get("follower_count", ""),
                         "Reason": "",
@@ -82,23 +89,41 @@ class InstagramPlatform(BasePlatform):
                 msg = ""
                 if isinstance(data, dict):
                     msg = str(data.get("message", ""))
-                if "login" in msg.lower() or not data:
+                low_msg = msg.lower()
+                # Sirf explicit login/challenge response hi DEAD hai. Empty 200
+                # aksar datacenter IP block hota hai — usay DEAD kehna false
+                # positive tha.
+                if any(k in low_msg for k in (
+                    "login_required", "checkpoint_required",
+                    "challenge_required", "user_required",
+                    "please log in", "login required",
+                )):
                     return {
                         "Status": "DEAD",
                         "Platform": "instagram",
-                        "Reason": f"login_required ({msg or 'empty response'})",
+                        "Reason": f"login_required ({msg})",
                     }
                 return {
                     "Status": "UNKNOWN",
                     "Platform": "instagram",
-                    "Reason": "HTTP 200 without user payload",
+                    "Reason": (
+                        "HTTP 200 without user payload"
+                        + (f" ({msg})" if msg else " (empty response / IP block?)")
+                    ),
                 }
 
-            if r.status_code in (401, 403):
+            if r.status_code == 401:
                 return {
                     "Status": "DEAD",
                     "Platform": "instagram",
-                    "Reason": "auth failed (401/403)",
+                    "Reason": "auth failed (401)",
+                }
+            if r.status_code == 403:
+                # Checkpoint / IP block ka proof nahi — false DEAD se bachao.
+                return {
+                    "Status": "UNKNOWN",
+                    "Platform": "instagram",
+                    "Reason": "HTTP 403 (IP/checkpoint block ho sakta hai)",
                 }
 
             if r.status_code == 429:
@@ -170,6 +195,32 @@ class InstagramPlatform(BasePlatform):
             creation_id = (r.json() or {}).get("id")
             if not creation_id:
                 return False, None, "graph: creation id nahi mila"
+
+            # Graph image container ko process hone me waqt lagta hai. Direct
+            # publish karne par "Media not ready" milta hai.
+            status = ""
+            polls = max(int(os.getenv("IG_MEDIA_POLLS", "10") or 0), 0)
+            interval = max(float(os.getenv("IG_MEDIA_POLL_SEC", "2") or 0), 0.5)
+            for _ in range(polls):
+                try:
+                    rs = await client.get(
+                        f"{self.GRAPH_URL}/{creation_id}",
+                        params={
+                            "fields": "status_code",
+                            "access_token": access_token,
+                        },
+                    )
+                    if rs.status_code == 200:
+                        status = str((rs.json() or {}).get("status_code") or "")
+                except Exception:  # noqa: BLE001
+                    logger.debug("IG media status poll failed", exc_info=True)
+                if status in ("FINISHED", "ERROR", "EXPIRED"):
+                    break
+                await asyncio.sleep(interval)
+            if status == "ERROR":
+                return False, None, "graph: media processing error"
+            if status == "EXPIRED":
+                return False, None, "graph: media container expired"
 
             r2 = await client.post(
                 f"{self.GRAPH_URL}/{target_id}/media_publish",

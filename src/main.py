@@ -95,7 +95,8 @@ async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWr
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: application/json\r\n"
                 b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-                b"Connection: close\r\n\r\n" + body
+                b"Connection: close\r\n\r\n"
+                + (body if method == "GET" else b"")
             )
         else:
             response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -166,6 +167,21 @@ async def post_init(app):
             logger.exception("startup netcheck failed")
 
 
+async def on_error(update, context):
+    """Log handler crashes instead of failing silently (admins ko short hint)."""
+    logger.error("handler error: %s", context.error, exc_info=context.error)
+    try:
+        user = getattr(update, "effective_user", None)
+        if user is not None and user.id in ADMIN_IDS:
+            msg = getattr(update, "effective_message", None)
+            if msg is not None:
+                await msg.reply_text(
+                    f"Error: {type(context.error).__name__}. Logs check karo."
+                )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def post_shutdown(app):
     """Graceful shutdown: stop campaigns, close health server."""
     logger.info("Bot shutting down...")
@@ -208,6 +224,8 @@ def main():
     ]
     for cmd, fn in handlers:
         app.add_handler(CommandHandler(cmd, fn))
+
+    app.add_error_handler(on_error)
 
     # Cookie zip/txt uploads
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
