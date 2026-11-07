@@ -5,9 +5,10 @@ import os
 import sys
 
 import pytest
+from cryptography.fernet import Fernet
 
-# Set ENCRYPTION_KEY before importing crypto module
-os.environ["ENCRYPTION_KEY"] = "test_key_123456789012345678901234"
+# Set a valid ENCRYPTION_KEY before importing crypto module
+os.environ["ENCRYPTION_KEY"] = Fernet.generate_key().decode()
 
 import src.utils.crypto as crypto_mod
 

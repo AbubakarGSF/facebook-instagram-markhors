@@ -23,7 +23,7 @@ class InstagramPlatform(BasePlatform):
     CHECK_URL = "https://www.instagram.com/"
     MOBILE_CHECK_URL = "https://www.instagram.com/accounts/edit/"
 
-    async def live_check(self, client: httpx.AsyncClient, cookies: Dict[str, str]) -> Dict[str, Any]:
+    async def live_check_impl(self, client: httpx.AsyncClient, cookies: Dict[str, str]) -> Dict[str, Any]:
         """Instagram cookie se check karo ki account working hai ya dead."""
 
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())

@@ -72,7 +72,14 @@ def norm_proxy(raw: str, default_scheme: Optional[str] = None) -> Optional[str]:
         if scheme not in PROXY_SCHEMES:
             scheme = "http"
 
-    if "@" in body or "/" in body:
+    if "@" in body:
+        norm = _norm_auth_host(body)
+        if not norm:
+            logging.warning("proxy invalid: %s", s)
+            return None
+        auth, hostpart = norm
+        s = scheme + "://" + auth + "@" + hostpart
+    elif "/" in body:
         s = scheme + "://" + body
     else:
         parts = _colon_proxy_parts(body)
@@ -98,35 +105,71 @@ def norm_proxy(raw: str, default_scheme: Optional[str] = None) -> Optional[str]:
     return str(p)
 
 
+def _norm_auth_host(body: str) -> Optional[Tuple[str, str]]:
+    """auth@host:port parse karo, unbracketed IPv6 ko bracket karo."""
+    if "@" not in body:
+        return None
+    auth, hostpart = body.rsplit("@", 1)
+    if not auth or not hostpart:
+        return None
+    if hostpart.startswith("["):
+        return auth, hostpart
+    if hostpart.count(":") <= 1:
+        return auth, hostpart
+    # Unbracketed IPv6 + port: last numeric segment port hai
+    bits = hostpart.split(":")
+    for i in range(len(bits) - 1, 0, -1):
+        if bits[i].isdigit():
+            if i + 1 != len(bits):
+                return None
+            host = ":".join(bits[:i])
+            if not host:
+                return None
+            return auth, f"[{host}]:{bits[i]}"
+    return None
+
+
 def _colon_proxy_parts(s: str) -> Optional[Tuple[str, str, str, str]]:
-    """host:port[:user[:pass]] parse karo."""
+    """host:port[:user[:pass]] parse karo (IPv4 / hostname / IPv6)."""
     s = (s or "").strip()
     if not s:
         return None
-    creds = []
+
     if s.startswith("["):
         m = re.match(r"^\[([^\]]+)\]:(.*)$", s)
         if not m:
             return None
-        host, bits = m.group(1), m.group(2).split(":")
-        if not bits or not bits[0].isdigit():
+        host, rest = m.group(1), m.group(2).split(":")
+        if not rest or not rest[0].isdigit():
             return None
-        port, creds = bits[0], bits[1:]
+        port, creds = rest[0], rest[1:]
     else:
-        # Unbracketed host:port[:user[:pass]]
-        # For unbracketed IPv6 like 2001:db8::1:1080, the port is second-to-last segment
-        # and creds are after that (if any)
         bits = s.split(":")
-        if len(bits) < 2:
-            return None
-        port_candidate = bits[-2]
-        if not port_candidate.isdigit():
-            return None
-        host = ":".join(bits[:-1])
-        creds = bits[-1:]
+        if len(bits) in (2, 3, 4) and bits[1].isdigit():
+            # host:port[:user[:pass]]
+            host, port, creds = bits[0], bits[1], bits[2:]
+        else:
+            # Unbracketed IPv6: ipv6:port[:user[:pass]]
+            # Port = aakhri numeric segment; uske baad creds.
+            idx = None
+            for i in range(len(bits) - 1, 0, -1):
+                if bits[i].isdigit():
+                    idx = i
+                    break
+            if idx is None:
+                return None
+            host = ":".join(bits[:idx])
+            port = bits[idx]
+            creds = bits[idx + 1:]
+
     if not host or not port.isdigit() or not (0 < int(port) < 65536):
         return None
-    return (host, port, creds[0] if len(creds) >= 1 else "", creds[1] if len(creds) >= 2 else "")
+    return (
+        host,
+        port,
+        creds[0] if len(creds) >= 1 else "",
+        creds[1] if len(creds) >= 2 else "",
+    )
 
 
 def load_proxies() -> List[str]:

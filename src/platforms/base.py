@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
 
 class BasePlatform:
     """Every platform (facebook, instagram) inherits from this."""
@@ -96,8 +98,94 @@ class BasePlatform:
 
     async def live_check(self, client: httpx.AsyncClient, cookies: Dict[str, str]) -> Dict[str, Any]:
         """Check if cookie is working. Returns dict with Status, Reason, and platform fields."""
+        return await self._check_with_retries(client, cookies, retries=self.retries)
+
+    async def _check_with_retries(self, client: httpx.AsyncClient, cookies: Dict[str, str], retries: int = 3) -> Dict[str, Any]:
+        """Run live_check with exponential backoff retries."""
+        last_result = None
+        for attempt in range(retries):
+            try:
+                result = await self._check_single(client, cookies)
+            except Exception as e:
+                logging.exception(f"live_check exception on attempt {attempt + 1}: {e}")
+                result = {
+                    "Status": "UNKNOWN",
+                    "Platform": self.__class__.__name__,
+                    "Reason": f"exception: {str(e)[:80]}",
+                }
+
+            last_result = result
+
+            # If LIVE, return immediately
+            if result.get("Status") == "LIVE":
+                return result
+
+            # If not last attempt, wait before retry
+            if attempt < retries - 1:
+                wait_time = min(2 ** attempt, 30)  # Exponential backoff: 1s, 2s, 4s... max 30s
+                self.logger.info(f"Verify attempt {attempt + 1} failed: {result.get('Reason', 'unknown')}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+
+        return last_result or {"Status": "UNKNOWN", "Platform": self.__class__.__name__, "Reason": "all retries failed"}
+
+    async def _check_single(self, client: httpx.AsyncClient, cookies: Dict[str, str]) -> Dict[str, Any]:
+        """Wrapper around live_check that subclasses implement."""
+        return await self.live_check_impl(client, cookies)
+
+    async def live_check_impl(self, client: httpx.AsyncClient, cookies: Dict[str, str]) -> Dict[str, Any]:
+        """Actual implementation - subclasses must implement this."""
         raise NotImplementedError
 
-    async def post(self, client: httpx.AsyncClient, cookies: Dict[str, str], text: str, media: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[str]]:
-        """Post content. Returns (ok, post_id, error)."""
-        raise NotImplementedError
+    async def _run_check(self, client: httpx.AsyncClient, cookies: Dict[str, str], retries: int = 2) -> Optional[Dict[str, Any]]:
+        """Run a check and swallow exceptions so the fallback can continue."""
+        try:
+            return await self._check_with_retries(client, cookies, retries=retries)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("%s check failed: %s", self.NAME, e)
+            return None
+
+    async def check_with_fallback(
+        self,
+        client_direct: Optional[httpx.AsyncClient],
+        client_proxy: Optional[httpx.AsyncClient],
+        cookies: Dict[str, str],
+        proxy_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Try direct first, then proxy (ya ulta), best result return karo.
+
+        Order:
+          - proxy available ho to pehle proxy (asli target wahi hai), phir direct.
+          - proxy fail ho jaye network-wise to direct fallback (Railway IP).
+        """
+        last: Optional[Dict[str, Any]] = None
+
+        candidates = []
+        if client_proxy is not None:
+            candidates.append(("proxy", client_proxy))
+        if client_direct is not None:
+            candidates.append(("direct", client_direct))
+
+        for label, client in candidates:
+            result = await self._run_check(client, cookies, retries=2)
+            if not result:
+                continue
+            if result.get("Status") == "LIVE":
+                result["via"] = label
+                return result
+            if result.get("Status") == "DEAD":
+                # Cookie genuinely dead — dusra route try karne ka faida nahi.
+                result["via"] = label
+                return result
+            last = result
+
+        if last:
+            last.setdefault("via", "none")
+            last["Reason"] = f"all routes failed: {last.get('Reason', 'unknown')}"
+            return last
+
+        return {
+            "Status": "UNKNOWN",
+            "Platform": self.NAME,
+            "Reason": "both direct and proxy failed",
+            "via": "none",
+        }
