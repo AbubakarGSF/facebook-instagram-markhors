@@ -24,8 +24,25 @@ def _env_list(name: str, default: str = "") -> Set[int]:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN")
 ADMIN_IDS = _env_list("ADMIN_IDS", "")
-WEBSITE = os.getenv("WEBSITE", "https://socialmarkhors.me")
-CREDIT = os.getenv("CREDIT", "Config by Social Markhors")
+BRAND = os.getenv("BRAND", "Evil Markhors")
+WEBSITE = os.getenv("WEBSITE", "https://evilmarkhors.me, https://evilmarkhors.tech")
+CREDIT = os.getenv("CREDIT", "Config by Evil Markhors")
+
+# Branding links (reworked cookie files + campaign post signature)
+WHATSAPP_URL = os.getenv(
+    "WHATSAPP_URL", "https://whatsapp.com/channel/0029Vb5qjwcG8l5CaqjMSU0K"
+)
+TELEGRAM_URL = os.getenv("TELEGRAM_URL", "https://t.me/+IGM63Xe1A-43ZTdk")
+TWITTER_URL = os.getenv("TWITTER_URL", "https://x.com/EvilMarkhors")
+FACEBOOK_URL = os.getenv(
+    "FACEBOOK_URL", "https://www.facebook.com/share/19FyzDCNe6/"
+)
+
+# Campaign default hashtag + auto branding footer on every post
+DEFAULT_TAG = os.getenv("DEFAULT_TAG", "#EvilMarkhors")
+POST_BRANDING = os.getenv("POST_BRANDING", "1").strip().lower() in (
+    "1", "true", "yes", "on"
+)
 
 CONCURRENCY = int(os.getenv("CONCURRENCY", "8"))
 TIMEOUT = float(os.getenv("TIMEOUT", "25"))
@@ -64,7 +81,7 @@ VERIFY_CONFIRM_DEAD = os.getenv("VERIFY_CONFIRM_DEAD", "1").strip().lower() in (
 )
 
 # Bot version
-BOT_VERSION = "2.3.0"
+BOT_VERSION = "2.3.1"
 
 # Encryption key for cookie storage at rest
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")

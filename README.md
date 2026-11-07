@@ -59,7 +59,27 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 - `/camp text` → variants bhejo → `/camp idle`
 - `/camp media`, `/camp filter country PK,US|followers 500`, `/camp delay 45-110`
 - `/camp limit 50`, `/camp dry`, `/camp source zip|db`, `/camp preview`
+- `/camp tag #EvilMarkhors`, `/camp branding on|off`
 - `/camp start`, `/camp reset`, `/stopcamp`
+
+## Branding
+
+Reworked cookie file ka header aur campaign posts dono branded hote hain.
+Default links ye hain (env se override ho sakte hain):
+
+```
+Evil Markhors
+https://evilmarkhors.me, https://evilmarkhors.tech
+Config by Evil Markhors
+– WhatsApp: https://whatsapp.com/channel/0029Vb5qjwcG8l5CaqjMSU0K
+– Telegram: https://t.me/+IGM63Xe1A-43ZTdk
+– Twitter:  https://x.com/EvilMarkhors
+– Facebook: https://www.facebook.com/share/19FyzDCNe6/
+```
+
+Campaign post ke end me `DEFAULT_TAG` + website + social links ka footer
+automatically lagta hai. Band karna ho to `/camp branding off`
+(ya `POST_BRANDING=0`).
 
 **Admin**
 - `/db stats | /db export fb|ig | /db reverify fb|ig [limit]`

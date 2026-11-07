@@ -27,13 +27,20 @@ from config.settings import (
     ACC_TIMEOUT,
     ADMIN_IDS,
     BOT_VERSION,
+    BRAND,
     CONCURRENCY,
     CREDIT,
+    DEFAULT_TAG,
+    FACEBOOK_URL,
     MAX_FILES,
+    POST_BRANDING,
     STATE_DIR,
     SUPABASE_URL,
+    TELEGRAM_URL,
+    TWITTER_URL,
     VERIFY_CONFIRM_DEAD,
     WEBSITE,
+    WHATSAPP_URL,
     ZIP_MAX_FILE,
     ZIP_MAX_TOTAL,
 )
@@ -116,10 +123,33 @@ def _norm_meta(data: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 
+def branding_lines() -> List[str]:
+    """Branding links jo har reworked cookie file ke header me jate hain."""
+    return [
+        f"\u2013 WhatsApp: {WHATSAPP_URL}",
+        f"\u2013 Telegram: {TELEGRAM_URL}",
+        f"\u2013 Twitter: {TWITTER_URL}",
+        f"\u2013 Facebook: {FACEBOOK_URL}",
+    ]
+
+
+def post_signature(tag: str = "") -> str:
+    """Campaign post ke end me branding block (links + hashtag)."""
+    lines = [tag] if tag else []
+    lines.append(f"Website: {WEBSITE}")
+    lines.append(f"WhatsApp: {WHATSAPP_URL}")
+    lines.append(f"Telegram: {TELEGRAM_URL}")
+    lines.append(f"Twitter: {TWITTER_URL}")
+    lines.append(f"Facebook: {FACEBOOK_URL}")
+    return "\n".join(lines)
+
+
 def build_cookie_file(data: Dict[str, Any], cookies: List[str]) -> str:
     """Build a cookie file string from metadata and cookies."""
     meta = _norm_meta(data)
-    out = ["Valid Cookie  /  Every day!", WEBSITE, CREDIT, ""]
+    out = ["Valid Cookie  /  Every day!", WEBSITE, CREDIT]
+    out.extend(branding_lines())
+    out.append("")
     for f in FIELDS:
         v = meta.pop(f, None)
         out.append("\u2013 " + f + ": " + (v if v not in (None, "") else "\u2013"))
@@ -292,13 +322,14 @@ def new_camp() -> dict:
     return {
         "name": "",
         "platform": "",
-        "tag": "#SocialMarkhors",
+        "tag": DEFAULT_TAG,
         "filter": {"countries": [], "years": [], "min_followers": 0},
         "limit": 0,
         "delay": [45, 110],
         "max_parts": 3,
         "cleanup_partial": True,
         "dry_run": False,
+        "branding": True,
         "source": "zip",
         "stage": "idle",
         "stage_at": 0.0,
@@ -525,7 +556,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
     await update.message.reply_text(
-        "Social Markhors Bot\n\n"
+        f"{BRAND} Bot\n\n"
         "Platforms: Facebook, Instagram\n\n"
         "Modes:\n"
         "1) COOKIE REWORK - /rework > cookie .txt/.zip bhejo\n"
@@ -556,6 +587,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /camp text > variants bhejo | /camp idle\n"
         "  /camp filter country PK,US | /camp filter followers 500\n"
         "  /camp delay 45-110 | /camp limit 50 | /camp dry (test mode)\n"
+        "  /camp tag #EvilMarkhors | /camp branding on|off\n"
         "  /camp source zip|db | /camp preview | /camp start | /camp reset\n"
         "  /stopcamp\n\n"
         "DB: /db stats | /db export fb|ig | /db reverify fb|ig [limit]\n"
@@ -574,7 +606,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fb = "ON" if _fb_platform else "OFF"
     ig = "ON" if _ig_platform else "OFF"
     await update.message.reply_text(
-        f"Social Markhors Bot v{BOT_VERSION}\n"
+        f"{BRAND} Bot v{BOT_VERSION}\n"
         f"Credit: {CREDIT}\n"
         f"Web: {WEBSITE}\n"
         f"Admin: {uid in ADMIN_IDS}\n"
@@ -984,6 +1016,7 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"CAMP {cfg['name'] or '-'} | {cfg['stage']}\n"
             f"Platform: {cfg['platform']}\n"
             f"Tag: {cfg['tag']}\n"
+            f"Branding: {'on' if cfg.get('branding', True) else 'off'}\n"
             f"Source: {cfg['source']}\n"
             f"Filter: {cfg['filter']}\n"
             f"Limit: {cfg['limit']}\n"
@@ -1105,6 +1138,32 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         save_camp(uid)
         await update.message.reply_text(f"Limit = {cfg['limit']}")
+        return
+
+    if sub == "branding":
+        val = (args[1] if len(args) > 1 else "").lower()
+        if val in ("on", "1", "yes"):
+            cfg["branding"] = True
+        elif val in ("off", "0", "no"):
+            cfg["branding"] = False
+        else:
+            await update.message.reply_text(
+                f"Branding = {'on' if cfg.get('branding', True) else 'off'}"
+                " | /camp branding on|off"
+            )
+            return
+        save_camp(uid)
+        await update.message.reply_text(f"Branding = {'on' if cfg['branding'] else 'off'}")
+        return
+
+    if sub == "tag":
+        t = args[1] if len(args) > 1 else ""
+        if not t:
+            await update.message.reply_text("Tag do: /camp tag #EvilMarkhors")
+            return
+        cfg["tag"] = t if t.startswith("#") else "#" + t.lstrip("#")
+        save_camp(uid)
+        await update.message.reply_text(f"Tag = {cfg['tag']}")
         return
 
     if sub == "delay":
@@ -1339,6 +1398,8 @@ async def _campaign_loop(
             return
 
         text = random.choice(texts)
+        if cfg.get("branding", POST_BRANDING):
+            text = text.rstrip() + "\n\n" + post_signature(cfg.get("tag") or DEFAULT_TAG)
         post_proxy = proxy if check.get("via") == "proxy" else None
         access_token = str(acc.get("access_token") or "")
         target_id = str(acc.get("target_id") or "")
@@ -1423,8 +1484,12 @@ async def _campaign_loop(
                     last=last_note,
                 )
 
-        # Delay between accounts (skipped after /stopcamp).
-        if not (state.get("stop") or CAMPRUN.get(uid, {}).get("stop")):
+        # Delay between accounts (skipped after /stopcamp; dry run me bhi nahi).
+        if not (
+            state.get("stop")
+            or CAMPRUN.get(uid, {}).get("stop")
+            or cfg.get("dry_run")
+        ):
             lo, hi = cfg["delay"]
             await asyncio.sleep(random.uniform(min(lo, hi), max(lo, hi)))
 
