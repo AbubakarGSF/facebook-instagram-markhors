@@ -1,39 +1,88 @@
 # Social Markhors Bot (Facebook + Instagram)
 
 Alag project hai `evilmarkhorsX_Bot` se. ye project sirf **Facebook aur Instagram** ke liye hai:
-- cookie rework + branding (alt format support)
-- live check (working/dead/suspended)
-- campaign post
-- Supabase db storage (per-platform)
+- cookie rework + branding (Netscape / `key=value` / `key: value` support)
+- live check (LIVE / DEAD / UNKNOWN)
+- campaign post (zip ya DB source)
+- Supabase storage (alag tables: `fb_accounts`, `ig_accounts`)
 
-ye project `evilmarkhorsX_Bot` se **kabhi mix nahi hoga**. dono ke alag-alag repo, alag-alag Railway deploy.
+ye project `evilmarkhorsX_Bot` se **kabhi mix nahi hoga**. dono ke alag-alag repo, alag-alag Railway deploy, alag bot token, alag Supabase tables.
 
 ## Structure
 
 | Folder | Purpose |
 |--------|---------|
-| `src/platforms/facebook.py` | FB login check, post, db |
-| `src/platforms/instagram.py` | IG login check, post, db |
-| `src/platforms/base.py` | Shared base class (proxy, headers, rate limit) |
-| `src/database/supabase.py` | Supabase client (per-platform tables) |
-| `src/utils/proxy.py` | Proxy rotation (same logic as evilmarkhors bot) |
-| `src/bot.py` | Telegram bot handler |
-| `src/main.py` | Entry point |
+| `src/platforms/facebook.py` | FB live check, Graph API post |
+| `src/platforms/instagram.py` | IG live check (private API), Graph API media post |
+| `src/platforms/base.py` | Shared base: proxy client, strict cookie parser, retries |
+| `src/database/supabase.py` | Supabase client (per-platform tables, upsert + patch status) |
+| `src/utils/proxy.py` | Proxy load/add/test/on-off + mask |
+| `src/utils/crypto.py` | Fernet cookie encryption at rest |
+| `src/utils/audit.py` | Async admin action audit log (rotating) |
+| `src/bot.py` | Telegram handlers, file processing, campaign loop |
+| `src/main.py` | Entry point, JSON logging, health server |
 
 ## Env Vars
 
-copy `.env.example` to `.env` aur fill karo:
+`.env.example` copy karke `.env` banao:
 
 ```
 BOT_TOKEN=...
-ADMIN_IDS=...
+ADMIN_IDS=123,456
 SUPABASE_URL=...
-SUPABASE_KEY=...
-PROXIES=...
+SUPABASE_KEY=service_role_key
+ENCRYPTION_KEY=...            # mandatory — bot iske bina start nahi hota
+PROXIES=host:port:user:pass
 PROXY_TYPE=socks5
-PROXY_MODE=rotate
-HEALTH_CHECK_PORT=8080
 ```
+
+Optional: `HEALTH_CHECK_PORT` / Railway `PORT`, `CONCURRENCY`, `TIMEOUT`,
+`ACC_TIMEOUT`, `MAX_FILES`, `VERIFY_SLOW_RETRY_SEC`, `VERIFY_CONFIRM_DEAD`,
+`PROGRESS_UPDATE_SEC`, `NETCHECK_ON_START`, `STATE_DIR`, `ZIP_MAX_*`.
+
+`ENCRYPTION_KEY` generate karne ke liye:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+## Commands
+
+**Modes**
+- `/rework` — cookie `.txt` ya `.zip` bhejo, branded output (working/unknown/errors)
+- `/verify` — zip bhejo, LIVE/DEAD/UNKNOWN check (proxy + direct fallback)
+- `/live on|off` — rework ke saath live check
+- `/cancel`
+
+**Campaign**
+- `/camp new <name>` → `/camp platform facebook|instagram`
+- `/camp text` → variants bhejo → `/camp idle`
+- `/camp media`, `/camp filter country PK,US|followers 500`, `/camp delay 45-110`
+- `/camp limit 50`, `/camp dry`, `/camp source zip|db`, `/camp preview`
+- `/camp start`, `/camp reset`, `/stopcamp`
+
+**Admin**
+- `/db stats | /db export fb|ig | /db reverify fb|ig [limit]`
+- `/proxy status|add|test|on|off|detect`
+- `/netcheck`, `/diag`, `/status`
+
+## DB behaviour (important)
+
+- Verify ke baad **LIVE, DEAD aur UNKNOWN teeno** rows insert/update hoti hain.
+- `last_check` har verify par set hota hai; `last_ok` sirf LIVE par.
+- Cookies `ENCRYPTION_KEY` se encrypt hokar save hoti hain.
+- Rework-only run (live check OFF) DB me kuch save nahi karta.
+- Campaign post success par row `status=live`, `last_post` ke saath upsert hoti hai.
+
+## Posting reality
+
+Cookie-only posting reliable nahi hai, is liye bot jhoot nahi bolta:
+
+- **Facebook**: Graph API `access_token` chahiye. Token na ho to result `UNSUPPORTED`.
+- **Instagram**: `access_token` + IG business id + **public image URL** chahiye
+  (Graph API text-only post support nahi karta). Warna `UNSUPPORTED`.
+- Campaign summary me `Unsupported (token/media missing)` alag count hota hai,
+  failed posts me mix nahi hota.
 
 ## Run
 
@@ -41,6 +90,9 @@ HEALTH_CHECK_PORT=8080
 pip install -r requirements.txt
 python src/main.py
 ```
+
+Railway par `PORT` automatically health server ke liye use hota hai
+(`/healthz` ya `/` → `200 {"status":"ok"}`).
 
 ## Note
 

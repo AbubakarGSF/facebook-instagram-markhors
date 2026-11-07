@@ -5,6 +5,8 @@ Admin commands: /start, /help, /status, /diag, /proxy, /netcheck, /rework,
 """
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
@@ -16,21 +18,40 @@ import time
 import zipfile as _zipfile
 from typing import Any, Dict, List, Optional
 
-import filetype
 import httpx
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config.settings import ADMIN_IDS, BOT_VERSION, CREDIT, CONCURRENCY, MAX_FILES, STATE_DIR, WEBSITE, ZIP_MAX_TOTAL
+from config.settings import (
+    ACC_TIMEOUT,
+    ADMIN_IDS,
+    BOT_VERSION,
+    CONCURRENCY,
+    CREDIT,
+    MAX_FILES,
+    STATE_DIR,
+    SUPABASE_URL,
+    VERIFY_CONFIRM_DEAD,
+    WEBSITE,
+    ZIP_MAX_FILE,
+    ZIP_MAX_TOTAL,
+)
 from src.database.supabase import SupabaseDB
 from src.platforms.base import BasePlatform
 from src.platforms.facebook import FacebookPlatform
 from src.platforms.instagram import InstagramPlatform
 from src.utils.crypto import decrypt_cookies, encrypt_cookies
-from src.utils.crypto import decrypt_cookies, encrypt_cookies
-from src.utils.proxy import load_proxies, proxy_status_text, norm_proxy, mask_sensitive
-from src.utils.ratelimit import rate_limiter
+from src.utils.proxy import (
+    add_proxy,
+    get_active_proxies,
+    load_proxies,
+    mask_proxy,
+    norm_proxy,
+    proxy_status_text,
+    set_proxy_enabled,
+    test_proxies,
+)
 from src.utils.audit import audit_log
 
 logger = logging.getLogger(__name__)
@@ -44,8 +65,15 @@ FIELDS = ["Status", "Username", "ID", "Followers", "Friends", "Posts", "Likes", 
           "Email", "Phone", "2FA", "Card added", "API", "Developer API"]
 
 # Cookie field names that should be marked HttpOnly
-HTTPONLY_NAMES = {"auth_token", "ct0", "kdt", "twid", "guest_id",
-                  "guest_id_marketing", "guest_id_ads"}
+HTTPONLY_NAMES = {
+    # X/Twitter
+    "auth_token", "ct0", "kdt", "twid", "guest_id",
+    "guest_id_marketing", "guest_id_ads",
+    # Facebook
+    "c_user", "xs", "datr", "sb", "fr", "presence", "locale",
+    # Instagram
+    "sessionid", "ds_user_id", "csrftoken", "mid", "ig_did", "rur",
+}
 
 
 def _cookie_line(ck: str) -> str:
@@ -154,6 +182,41 @@ def parse_meta(raw: str, filename: str = "") -> Dict[str, str]:
     return meta
 
 
+_GENERIC_USERNAMES = {
+    "facebook", "instagram", "meta", "log in", "login", "home", "watch",
+    "profile", "account", "unknown",
+}
+
+
+def merge_check_meta(meta: Dict[str, str], check: Dict[str, Any], platform: str) -> None:
+    """Live-check result ko metadata me merge karo without clobbering good data.
+
+    Pehle `meta.update(check)` filename se aaya hua username/ID bhi generic
+    page title ("Facebook") se overwrite kar deta tha.
+    """
+    uname = str(check.get("username") or "").strip().lstrip("@")
+    if uname and uname.lower() not in _GENERIC_USERNAMES:
+        meta["Username"] = uname
+
+    pid = check.get("fb_id") if platform == "facebook" else check.get("ig_id")
+    if pid:
+        meta["ID"] = str(pid)
+
+    followers = check.get("followers")
+    if followers not in (None, ""):
+        fnum = _to_int(followers)
+        if fnum:
+            meta["Followers"] = str(fnum)
+
+    country = str(check.get("country") or "").strip()
+    if country:
+        meta["Country"] = country
+
+    verified = check.get("verified")
+    if verified is not None:
+        meta["Verified"] = "true" if str(verified).lower() in ("1", "true", "yes") else "false"
+
+
 # ============================ GLOBAL STATE ============================
 
 _db: Optional[SupabaseDB] = None
@@ -209,6 +272,20 @@ def get_platform(platform_name: str) -> Optional[BasePlatform]:
     if platform_name == "instagram":
         return _ig_platform
     return None
+
+
+def _account_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Supabase row -> campaign account dict (cookies decrypted)."""
+    cookies = row.get("cookies") or {}
+    return {
+        "username": str(row.get("username") or row.get("fb_id") or row.get("ig_id") or ""),
+        "cookies": decrypt_cookies(cookies) if cookies else {},
+        "country": row.get("country") or "",
+        "followers": row.get("followers") or 0,
+        "verified": row.get("verified"),
+        "access_token": row.get("access_token") or "",
+        "target_id": row.get("fb_id") or row.get("ig_id") or "",
+    }
 
 
 def new_camp() -> dict:
@@ -289,18 +366,59 @@ def safe_zip_entry_name(name: str) -> str:
 
 
 def _pick_proxy() -> Optional[str]:
-    """Loaded proxy list se ek valid proxy choose karo (env string se nahi)."""
+    """Currently active proxy list se ek valid proxy choose karo."""
     try:
-        proxies = load_proxies()
+        proxies = get_active_proxies()
     except Exception:  # noqa: BLE001
-        logger.exception("load_proxies failed")
+        logger.exception("get_active_proxies failed")
         proxies = []
     return random.choice(proxies) if proxies else None
 
 
+def _is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
+
+async def _require_admin(update: Update) -> bool:
+    """Reply 'Sirf admin' and return False when the sender is not an admin."""
+    if _is_admin(update.effective_user.id):
+        return True
+    if update.message:
+        await update.message.reply_text("Sirf admin.")
+    return False
+
+
+def _detect_platform_from_name(name: str) -> Optional[str]:
+    """Filename se platform detect karo (word-boundary based).
+
+    Pehle `"ig" in name` tha — jis se `big.txt`, `login.txt`, `night.txt`
+    galti se Instagram ban jate the.
+    """
+    low = (name or "").lower()
+    parts = re.split(r"[^a-z0-9]+", low)
+    has_ig = "instagram" in parts or "ig" in parts or "insta" in parts
+    has_fb = "facebook" in parts or "fb" in parts or "meta" in parts
+    if has_ig and has_fb:
+        return None
+    if has_ig:
+        return "instagram"
+    if has_fb:
+        return "facebook"
+    return None
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    """'1,234 followers' -> 1234; invalid -> default."""
+    try:
+        cleaned = re.sub(r"[^0-9\-]", "", str(value or ""))
+        return int(cleaned) if cleaned not in ("", "-") else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _status_folder(status: str) -> str:
     """Result status ko output folder name me map karo."""
-    if status == "LIVE":
+    if status in ("LIVE", "REWORKED"):
         return "working"
     if status == "DEAD":
         return "dead"
@@ -410,10 +528,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Social Markhors Bot\n\n"
         "Platforms: Facebook, Instagram\n\n"
         "Modes:\n"
-        "1) COOKIE REWORK - /rework > cookie .txt bhejo\n"
+        "1) COOKIE REWORK - /rework > cookie .txt/.zip bhejo\n"
         "2) VERIFY - /verify > cookie zip bhejo\n"
-        "3) CAMPAIGN - /camp new > /camp start\n\n"
-        "Admin: /db /proxy /netcheck\n\n"
+        "3) CAMPAIGN - /camp new > /camp platform > /camp text > /camp start\n\n"
+        "Admin: /db /proxy /netcheck /camp\n\n"
         "Full commands: /help"
     )
 
@@ -424,20 +542,27 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
     await update.message.reply_text(
-        "REWORK: /rework > cookie .txt bhejo\n"
-        "Supported formats:\n"
-        "  X/Twitter:   [plus] [2fa false] [email].txt\n"
-        "  Instagram:   [7 followers] [2 posts] [verified false] [business false] [username].txt\n"
+        "REWORK: /rework > cookie .txt ya .zip bhejo\n"
+        "Supported cookie formats:\n"
         "  Facebook:    [37 friends] [business false] [marketplace false] [] [userid].txt\n"
-        "  Reddit:      [1500 karma] [verified true] [username].txt\n"
-        "  Generic:     [free] [email].txt, free data @email .txt\n\n"
-        "VERIFY: /verify > cookie zip bhejo\n"
-        "LIVE: /live on|off\n"
-        "DB: /db stats | /db export fb | /db export ig\n"
-        "PROXY: /proxy test | /proxy add [type] host:port:user:pass\n"
+        "  Instagram:   [7 followers] [2 posts] [verified false] [business false] [username].txt\n"
+        "  Netscape:    domain\\tflag\\tpath\\tsecure\\texpiry\\tname\\tvalue\n"
+        "  Header:      key=value ya key: value lines\n\n"
+        "VERIFY: /verify > cookie zip bhejo (LIVE / DEAD / UNKNOWN)\n"
+        "LIVE: /live on|off (rework ke saath live check)\n"
+        "CANCEL: /cancel\n\n"
+        "CAMPAIGN:\n"
+        "  /camp new <name> | /camp platform facebook|instagram\n"
+        "  /camp text > variants bhejo | /camp idle\n"
+        "  /camp filter country PK,US | /camp filter followers 500\n"
+        "  /camp delay 45-110 | /camp limit 50 | /camp dry (test mode)\n"
+        "  /camp source zip|db | /camp preview | /camp start | /camp reset\n"
+        "  /stopcamp\n\n"
+        "DB: /db stats | /db export fb|ig | /db reverify fb|ig [limit]\n"
+        "PROXY: /proxy status | /proxy add host:port:user:pass\n"
+        "       /proxy test | /proxy on | /proxy off | /proxy detect host:port\n"
         "NETCHECK: /netcheck\n\n"
-        "CAMPAIGN: /camp new > /camp text > /camp start\n\n"
-        "Admin: /db /proxy /netcheck /camp"
+        "Admin only: /db /proxy /netcheck /camp /rework /verify /live"
     )
 
 
@@ -456,7 +581,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Facebook: {fb}\n"
         f"Instagram: {ig}\n"
         f"DB: {'ON' if _db else 'OFF'}\n"
-        f"Proxies: {len(load_proxies())}"
+        f"Proxies: {len(get_active_proxies())} active / {len(load_proxies())} configured\n"
+        f"Campaigns: {len(CAMPS)} saved | {len(CAMPRUN)} running"
     )
 
 
@@ -477,50 +603,86 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in ADMIN_IDS:
-        await update.message.reply_text("Sirf admin.")
+    if not await _require_admin(update):
         return
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
-    args = context.args
-    if not args or args[0] == "status":
+
+    args = context.args or []
+    sub = args[0].lower() if args else "status"
+
+    if sub in ("status", "list", ""):
         await update.message.reply_text(proxy_status_text())
         await audit_log(uid, "proxy_status", {})
         return
-    if args[0] == "detect":
+
+    if sub == "detect":
         if len(args) < 2:
             await update.message.reply_text("Usage: /proxy detect <host:port[:user:pass]>")
             return
         entry = args[1]
-        await update.message.reply_text(f"Detecting proxy type for {entry}...")
+        await update.message.reply_text(f"Detecting proxy type for {mask_proxy(entry)}...")
         await _proxy_detect(update, entry)
-        await audit_log(uid, "proxy_detect", {"entry": entry})
+        await audit_log(uid, "proxy_detect", {"entry": mask_proxy(entry)})
         return
-    await update.message.reply_text("Usage: /proxy [status|detect host:port]")
-    await audit_log(uid, "proxy_status", {})
 
+    if sub == "add":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /proxy add <host:port[:user:pass]>")
+            return
+        ok, result = add_proxy(args[1])
+        if ok:
+            await update.message.reply_text(
+                f"Proxy added: {mask_proxy(result)}\nTotal: {len(get_active_proxies())}"
+            )
+            await audit_log(uid, "proxy_add", {"proxy": mask_proxy(result)})
+        else:
+            await update.message.reply_text(f"Proxy add failed: {result}")
+        return
 
-    await update.message.reply_text("Usage: /proxy [status|detect host:port]")
-    await audit_log(uid, "proxy_status", {})
+    if sub == "test":
+        proxies = get_active_proxies()
+        if not proxies:
+            await update.message.reply_text("Koi proxy configured nahi.")
+            return
+        await update.message.reply_text(f"Testing {min(len(proxies), 10)} proxies...")
+        results = await test_proxies()
+        await update.message.reply_text("Proxy test:\n" + "\n".join(results))
+        await audit_log(uid, "proxy_test", {"count": len(results)})
+        return
+
+    if sub in ("on", "off"):
+        set_proxy_enabled(sub == "on")
+        await update.message.reply_text(f"Proxy: {sub.upper()}")
+        await audit_log(uid, "proxy_toggle", {"enabled": sub == "on"})
+        return
+
+    await update.message.reply_text(
+        "Usage: /proxy [status|add host:port:user:pass|test|on|off|detect host:port]"
+    )
 
 
 async def _proxy_detect(u, entry: str):
     """Test both SOCKS5 and HTTP protocols against host:port and tell which works."""
-    async def probe(proxy_url: str):
+    body = re.sub(r"^[a-z0-9]+://", "", entry.strip(), flags=re.I)
+
+    async def probe(proxy_url: Optional[str]):
+        if not proxy_url:
+            return False
         cl = None
         try:
-            cl = httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(10.0))
+            cl = httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(10.0), trust_env=False)
             r = await cl.get("https://api.ipify.org?format=json")
             return r.status_code == 200
-        except Exception:
+        except Exception:  # noqa: BLE001
             return False
         finally:
             if cl is not None:
                 await cl.aclose()
 
-    socks_result = await probe(f"socks5://{entry}")
-    http_result = await probe(f"http://{entry}")
+    socks_result = await probe(norm_proxy("socks5://" + body))
+    http_result = await probe(norm_proxy("http://" + body))
 
     if socks_result and http_result:
         verdict = "Both SOCKS5 and HTTP work"
@@ -532,50 +694,85 @@ async def _proxy_detect(u, entry: str):
         verdict = "Neither works"
 
     await u.message.reply_text(
-        f"Proxy detect for {entry}:\n"
+        f"Proxy detect for {mask_proxy(entry)}:\n"
         f"SOCKS5: {'✓' if socks_result else '✗'}\n"
         f"HTTP:   {'✓' if http_result else '✗'}\n"
         f"Result: {verdict}"
     )
 
 
+async def run_netcheck() -> str:
+    """Check reachability of Facebook, Instagram and Supabase."""
+    targets = [
+        ("Facebook", "https://www.facebook.com/"),
+        ("Instagram", "https://www.instagram.com/"),
+    ]
+    if SUPABASE_URL:
+        targets.append(("Supabase", SUPABASE_URL + "/rest/v1/"))
+
+    lines = ["Netcheck:"]
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=httpx.Timeout(10.0), trust_env=False
+    ) as cl:
+        for label, url in targets:
+            started = time.time()
+            try:
+                r = await cl.get(url)
+                ms = (time.time() - started) * 1000
+                ok = r.status_code < 500
+                lines.append(
+                    f"{'✓' if ok else '✗'} {label}: HTTP {r.status_code} ({ms:.0f}ms)"
+                )
+            except Exception as e:  # noqa: BLE001
+                ms = (time.time() - started) * 1000
+                lines.append(f"✗ {label}: {type(e).__name__} ({ms:.0f}ms)")
+
+    proxies = get_active_proxies()
+    lines.append(f"Proxy: {len(proxies)} active" if proxies else "Proxy: OFF")
+    return "\n".join(lines)
+
+
 async def netcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Sirf admin.")
+    if not await _require_admin(update):
         return
-    if not check_user_rate_limit(update.effective_user.id):
+    uid = update.effective_user.id
+    if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
-    await update.message.reply_text(
-        "Netcheck: Facebook + Instagram + Supabase reachability test\n"
-        "Coming soon in next build."
-    )
-    await audit_log(update.effective_user.id, "netcheck", {})
+    try:
+        report = await run_netcheck()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("netcheck")
+        report = f"Netcheck failed: {type(e).__name__}: {e}"
+    await update.message.reply_text(report)
+    await audit_log(uid, "netcheck", {})
 
 
 async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not await _require_admin(update):
+        return
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
     prev_live = user_state.get(uid, {}).get("live", False)
     user_state[uid] = {"mode": "rework", "platform": None, "live": prev_live, "at": time.time()}
     await update.message.reply_text(
-        "Mode = rework. Ab cookie .txt bhejo.\n"
+        "Mode = rework. Ab cookie .txt ya .zip bhejo.\n"
         "Supported formats:\n"
-        "  X/Twitter:   [plus] [2fa false] [email].txt\n"
-        "  Instagram:   [7 followers] [2 posts] [verified false] [business false] [username].txt\n"
         "  Facebook:    [37 friends] [business false] [marketplace false] [] [userid].txt\n"
-        "  Reddit:      [1500 karma] [verified true] [username].txt\n"
-        "  Generic:     [free] [email].txt, free data @email .txt\n\n"
-        "Output: branded zip with standard format (platform metadata included).\n"
-        f"Live check: {'ON (rework + verify)' if prev_live else 'OFF (/live on karo rework ke saath verify ke liye)'}"
+        "  Instagram:   [7 followers] [2 posts] [verified false] [business false] [username].txt\n"
+        "  Netscape / key=value cookie lines bhi chalengi.\n\n"
+        "Output: branded zip (working/unknown/errors folders).\n"
+        f"Live check: {'ON (rework + verify)' if prev_live else 'OFF (/live on karo)'}"
     )
     await audit_log(uid, "rework_start", {})
 
 
 async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not await _require_admin(update):
+        return
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
@@ -583,15 +780,19 @@ async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Mode = verify. Ab cookie zip bhejo.\n"
         "Check: pehle proxy (agar configured hai), phir direct Railway IP.\n"
-        "Har route pe retries + backoff — network glitch ho to khud retry karega.\n"
-        "Supported formats:\n"
-        "  Instagram:   [7 followers] [2 posts] [verified false] [business false] [username].txt\n"
-        "  Facebook:    [37 friends] [business false] [marketplace false] [] [userid].txt\n"
+        "DEAD result proxy se aaye to direct se confirm hota hai "
+        "(VERIFY_CONFIRM_DEAD=0 se band).\n"
+        "Har route pe sirf UNKNOWN par retry + backoff hota hai.\n"
+        "Output folders: working/ dead/ unknown/ errors/\n"
+        "DB: LIVE/DEAD/UNKNOWN sab save/update hote hain (last_check + last_ok)."
     )
+    await audit_log(uid, "verify_start", {})
 
 
 async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not await _require_admin(update):
+        return
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
@@ -614,45 +815,155 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /live on|off")
 
 
+def _table_for(platform: str) -> str:
+    return "fb_accounts" if platform.lower() in ("fb", "facebook") else "ig_accounts"
+
+
+async def _db_export(update: Update, context: ContextTypes.DEFAULT_TYPE, platform: str) -> None:
+    table = _table_for(platform)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as cl:
+        rows = await _db.fetch(cl, table, {}, limit=5000)
+
+    if not rows:
+        await update.message.reply_text(f"{table}: koi row nahi.")
+        return
+
+    fields = [
+        "id", "username", "fb_id", "ig_id", "country", "followers",
+        "verified", "status", "fails", "source", "created_at",
+        "last_check", "last_ok", "last_post",
+    ]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: row.get(k, "") for k in fields})
+    data = io.BytesIO(buf.getvalue().encode("utf-8"))
+
+    await context.bot.send_document(
+        update.effective_chat.id,
+        document=data,
+        filename=f"{table}.csv",
+        caption=f"{table}: {len(rows)} rows (cookies/access_token excluded)",
+    )
+
+
+async def _db_reverify(update: Update, context: ContextTypes.DEFAULT_TYPE, platform: str, limit: int) -> None:
+    table = _table_for(platform)
+    platform_obj = get_platform("facebook" if table == "fb_accounts" else "instagram")
+    if not platform_obj:
+        await update.message.reply_text("Platform init nahi hua.")
+        return
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as cl:
+        rows = await _db.fetch(cl, table, {}, limit=min(max(limit, 1), 500))
+
+    if not rows:
+        await update.message.reply_text(f"{table}: koi row nahi.")
+        return
+
+    msg = await update.message.reply_text(f"DB reverify: {len(rows)} accounts...")
+    reporter = ProgressReporter(
+        msg,
+        f"DB REVERIFY: {table}",
+        len(rows),
+    )
+    counts = {"working": 0, "dead": 0, "unknown": 0, "errors": 0}
+    last_note = ""
+    done = 0
+
+    for row in rows:
+        uname = str(row.get("username") or row.get("fb_id") or row.get("ig_id") or "?")
+        try:
+            ck = decrypt_cookies(row.get("cookies") or {})
+            check = await _verify_cookie(platform_obj, ck, proxy=_pick_proxy())
+            status = check.get("Status", "UNKNOWN")
+            counts[_status_folder(status)] += 1
+            last_note = f"{status} | {uname}"
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as dcl:
+                await _db.patch_status(
+                    dcl, table, uname, status.lower(), ok=(status == "LIVE")
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("db reverify %s", uname)
+            counts["errors"] += 1
+            last_note = f"ERROR {type(e).__name__} | {uname}"
+        done += 1
+        await reporter.update(done, counts, last=last_note)
+
+    await reporter.update(done, counts, last=last_note, force=True)
+    await msg.edit_text(
+        f"DB reverify done | {table}\n"
+        f"working: {counts['working']} | dead: {counts['dead']} | "
+        f"unknown: {counts['unknown']} | errors: {counts['errors']}"
+    )
+
+
 async def db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in ADMIN_IDS:
-        await update.message.reply_text("Sirf admin.")
+    if not await _require_admin(update):
         return
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
 
-    args = context.args
+    args = context.args or []
     sub = args[0].lower() if args else "stats"
 
     if not _db:
         await update.message.reply_text("SUPABASE_URL / KEY set nahi.")
         return
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as cl:
-        if sub == "stats":
-            fb_count = await _db.count(cl, "fb_accounts")
-            ig_count = await _db.count(cl, "ig_accounts")
-            await update.message.reply_text(
-                f"DB stats:\nfb_accounts: {fb_count}\nig_accounts: {ig_count}"
-            )
-            await audit_log(uid, "db_stats", {})
-        elif sub == "export":
-            platform = args[1].lower() if len(args) > 1 else "fb"
-            table = "fb_accounts" if platform == "fb" else "ig_accounts"
-            await update.message.reply_text(f"Export from {table} - coming in next build")
-            await audit_log(uid, "db_export", {"table": table})
-        else:
-            await update.message.reply_text("/db stats | /db export fb | /db export ig")
+    if sub == "stats":
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as cl:
+            lines = ["DB stats:"]
+            for table in ("fb_accounts", "ig_accounts"):
+                total = await _db.count(cl, table)
+                live = await _db.count(cl, table, "live")
+                dead = await _db.count(cl, table, "dead")
+                unknown = await _db.count(cl, table, "unknown")
+                lines.append(
+                    f"{table}: {total} total | live {live} | dead {dead} | unknown {unknown}"
+                )
+        await update.message.reply_text("\n".join(lines))
+        await audit_log(uid, "db_stats", {})
+        return
+
+    if sub == "export":
+        platform = args[1].lower() if len(args) > 1 else "fb"
+        if platform not in ("fb", "facebook", "ig", "instagram"):
+            await update.message.reply_text("Usage: /db export fb|ig")
+            return
+        try:
+            await _db_export(update, context, platform)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("db export")
+            await update.message.reply_text(f"Export failed: {type(e).__name__}: {e}")
+        await audit_log(uid, "db_export", {"platform": platform})
+        return
+
+    if sub == "reverify":
+        platform = args[1].lower() if len(args) > 1 else "fb"
+        limit = _to_int(args[2], 100) if len(args) > 2 else 100
+        if platform not in ("fb", "facebook", "ig", "instagram"):
+            await update.message.reply_text("Usage: /db reverify fb|ig [limit]")
+            return
+        try:
+            await _db_reverify(update, context, platform, limit)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("db reverify")
+            await update.message.reply_text(f"Reverify failed: {type(e).__name__}: {e}")
+        await audit_log(uid, "db_reverify", {"platform": platform, "limit": limit})
+        return
+
+    await update.message.reply_text("/db stats | /db export fb|ig | /db reverify fb|ig [limit]")
 
 
 # ============================ CAMPAIGN ============================
 
 async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in ADMIN_IDS:
-        await update.message.reply_text("Sirf admin.")
+    if not await _require_admin(update):
         return
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
@@ -683,11 +994,6 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    cfg = CAMPS.get(uid)
-    if not cfg:
-        await update.message.reply_text("Pehle /camp new <name>.")
-        return
-
     if sub == "new":
         cfg = new_camp()
         cfg["name"] = safe_text((" ".join(args[1:]) or "camp"), 40)
@@ -698,6 +1004,11 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Ab /camp platform facebook|instagram karo."
         )
         await audit_log(uid, "campaign_new", {"name": cfg["name"]})
+        return
+
+    cfg = CAMPS.get(uid)
+    if not cfg:
+        await update.message.reply_text("Pehle /camp new <name>.")
         return
 
     if sub == "platform":
@@ -713,22 +1024,52 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sub == "text":
         cfg["stage"] = "text"
+        cfg["stage_at"] = time.time()
         save_camp(uid)
+        user_state[uid] = {
+            "mode": "campaign",
+            "stage": "text",
+            "platform": cfg.get("platform"),
+            "at": time.time(),
+        }
         await update.message.reply_text(
-            f"Text mode. Variants bhejo.\n/camp idle se band."
+            "Text mode. Variants bhejo (ek message = ek variant).\n/camp idle se band."
         )
         return
 
     if sub == "idle":
         cfg["stage"] = "idle"
         save_camp(uid)
+        st = user_state.get(uid, {})
+        if st.get("mode") == "campaign":
+            user_state.pop(uid, None)
         await update.message.reply_text("Band.")
         return
 
     if sub == "media":
         cfg["stage"] = "media"
+        cfg["stage_at"] = time.time()
         save_camp(uid)
-        await update.message.reply_text("Photo/video bhejo.")
+        user_state[uid] = {
+            "mode": "campaign",
+            "stage": "media",
+            "platform": cfg.get("platform"),
+            "at": time.time(),
+        }
+        await update.message.reply_text(
+            "Photo/video bhejo.\n"
+            "Note: IG Graph API ko public image URL chahiye; file_id se direct post nahi hota."
+        )
+        return
+
+    if sub == "source":
+        src = (args[1] if len(args) > 1 else "").lower()
+        if src not in ("zip", "db"):
+            await update.message.reply_text("/camp source zip|db")
+            return
+        cfg["source"] = src
+        save_camp(uid)
+        await update.message.reply_text(f"Source = {src}")
         return
 
     if sub == "filter":
@@ -798,14 +1139,25 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not cfg["texts"]:
             await update.message.reply_text("Pehle /camp text se variants bhejo.")
             return
-        if cfg["source"] == "db" and not _db:
-            await update.message.reply_text("DB off. /camp source zip")
+        if cfg["platform"] not in ("facebook", "instagram"):
+            await update.message.reply_text("Pehle /camp platform facebook|instagram set karo.")
+            return
+
+        if cfg.get("source") == "db":
+            if not _db:
+                await update.message.reply_text("DB off. /camp source zip karo.")
+                return
+            await _start_campaign_from_db(update, context, uid, cfg)
             return
 
         cfg["stage"] = "cookies"
         cfg["stage_at"] = time.time()
         save_camp(uid)
-        user_state[uid] = {"mode": "campaign", "platform": cfg["platform"], "at": time.time()}
+        user_state[uid] = {
+            "mode": "campaign",
+            "platform": cfg["platform"],
+            "at": time.time(),
+        }
         await update.message.reply_text(
             "Ab cookie zip bhejo (campaign ke liye)."
         )
@@ -813,9 +1165,20 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if sub == "reset":
+        name = cfg.get("name", "")
         CAMPS.pop(uid, None)
-        await update.message.reply_text("Reset.")
-        await audit_log(uid, "campaign_reset", {"name": cfg.get("name", "")})
+        user_state.pop(uid, None)
+        if uid in CAMPRUN:
+            CAMPRUN[uid]["stop"] = True
+        # State file delete karo, warna restart par load_camps() ise wapas le aata hai.
+        try:
+            path = os.path.join(STATE_DIR, f"camp_{uid}.json")
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            logger.exception("camp reset: state file delete failed")
+        await update.message.reply_text("Reset. Campaign state file bhi delete ho gayi.")
+        await audit_log(uid, "campaign_reset", {"name": name})
         return
 
     await update.message.reply_text("Subcommand samajh nahi aayi. /camp dekho.")
@@ -838,6 +1201,33 @@ async def stopcamp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================ CAMPAIGN LOOP ============================
+
+async def _start_campaign_from_db(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, cfg: dict):
+    """Fetch live accounts from Supabase and run the campaign without a zip."""
+    table = _table_for(cfg["platform"])
+    limit = cfg.get("limit") or 500
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as cl:
+        rows = await _db.fetch(cl, table, {"status": "eq.live"}, limit=min(limit, 5000))
+
+    accounts = []
+    for row in rows:
+        acc = _account_from_row(row)
+        if acc["cookies"]:
+            accounts.append(acc)
+    if cfg.get("limit"):
+        accounts = accounts[: cfg["limit"]]
+
+    if not accounts:
+        await update.message.reply_text(f"DB ({table}) me live accounts nahi mile.")
+        return
+
+    msg = await update.message.reply_text(f"DB campaign shuru: {len(accounts)} live accounts")
+    CAMPRUN[uid] = {"stop": False}
+    try:
+        await _campaign_loop(uid, cfg, accounts, CAMPRUN[uid], update=update, progress_msg=msg)
+    finally:
+        CAMPRUN.pop(uid, None)
+
 
 async def _campaign_loop(
     uid: int,
@@ -863,6 +1253,8 @@ async def _campaign_loop(
     posted_count = 0
     failed_count = 0
     skipped_count = 0
+    dry_count = 0
+    unsupported_count = 0
     done_count = 0
     last_note = ""
 
@@ -887,87 +1279,132 @@ async def _campaign_loop(
 
     sem = asyncio.Semaphore(max(CONCURRENCY, 1))
 
-    async def process_account(acc):
-        nonlocal posted_count, failed_count, skipped_count, done_count, last_note
-        if state.get("stop") or CAMPRUN.get(uid, {}).get("stop"):
-            skipped_count += 1
-            last_note = "STOP requested"
+    async def _do_account(acc):
+        nonlocal posted_count, failed_count, skipped_count, dry_count, unsupported_count, last_note
+        username = str(acc.get("username", "") or "")
+
+        ck = acc.get("cookies", {})
+        if not ck:
+            failed_count += 1
+            last_note = f"NO COOKIES | {username}"
+            return
+        ck = decrypt_cookies(ck)
+
+        proxy = _pick_proxy()
+        check = await _verify_cookie(platform_obj, ck, proxy=proxy)
+        status = check.get("Status", "UNKNOWN")
+
+        uname = str(check.get("username") or "").strip()
+        if not uname or uname.lower() in _GENERIC_USERNAMES:
+            uname = username
+        uname = safe_text(uname)
+
+        if status != "LIVE":
+            failed_count += 1
+            last_note = f"{status} ({check.get('via', '-')}) {check.get('Reason', '')[:40]} | {uname}"
+            if _db and uname:
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as db_cl:
+                        await _db.patch_status(
+                            db_cl,
+                            "fb_accounts" if platform == "facebook" else "ig_accounts",
+                            uname,
+                            status.lower(),
+                            ok=False,
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.debug("status patch failed", exc_info=True)
             return
 
-        username = str(acc.get("username", "") or "")
+        # Filters use the metadata saved with the account (live checks do not
+        # reliably return followers/country).
+        country = str(acc.get("country") or check.get("country") or "")
+        followers = _to_int(acc.get("followers")) or _to_int(
+            check.get("followers") or check.get("Followers")
+        )
+        if filt.get("countries") and country and country.upper() not in [
+            c.upper() for c in filt["countries"]
+        ]:
+            skipped_count += 1
+            last_note = f"FILTER country={country} | {uname}"
+            return
+        if filt.get("min_followers", 0) > followers:
+            skipped_count += 1
+            last_note = f"FILTER followers={followers} | {uname}"
+            return
+
+        if cfg.get("dry_run"):
+            dry_count += 1
+            last_note = f"DRY RUN (no post) | {uname}"
+            return
+
+        text = random.choice(texts)
+        post_proxy = proxy if check.get("via") == "proxy" else None
+        access_token = str(acc.get("access_token") or "")
+        target_id = str(acc.get("target_id") or "")
+        cl = platform_obj.http_client(proxy=post_proxy)
+        try:
+            ok, post_id, err = await platform_obj.post(
+                cl,
+                ck,
+                safe_text(text),
+                access_token=access_token or None,
+                target_id=target_id or None,
+            )
+        finally:
+            await cl.aclose()
+
+        if ok:
+            posted_count += 1
+            last_note = f"POSTED {post_id or ''} via {check.get('via', '-')} | {uname}"
+            if _db and uname:
+                now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                row = {
+                    "username": uname,
+                    "fb_id": str(check.get("fb_id") or (target_id if platform == "facebook" else "")) or "",
+                    "ig_id": str(check.get("ig_id") or (target_id if platform == "instagram" else "")) or "",
+                    "cookies": encrypt_cookies(ck),
+                    "country": country,
+                    "followers": followers,
+                    "verified": bool(acc.get("verified")) or str(check.get("Verified", "")).lower() == "true",
+                    "status": "live",
+                    "source": "campaign",
+                    "last_check": now,
+                    "last_ok": now,
+                    "last_post": now,
+                }
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as db_cl:
+                        saved, db_err = await _db.upsert(
+                            db_cl,
+                            "fb_accounts" if platform == "facebook" else "ig_accounts",
+                            [row],
+                        )
+                    if not saved:
+                        logger.warning("campaign DB save failed for %s: %s", uname, db_err)
+                except Exception:  # noqa: BLE001
+                    logger.exception("campaign DB save failed for %s", uname)
+        elif err and str(err).startswith("UNSUPPORTED"):
+            # Cookie-only post nahi hota (token / public media URL missing).
+            # Isay alag count karo taake summary sach bole.
+            unsupported_count += 1
+            last_note = f"UNSUPPORTED post | {uname}"
+        else:
+            failed_count += 1
+            last_note = f"POST FAILED: {err or 'unknown'} | {uname}"
+
+    async def process_account(acc):
+        nonlocal done_count, last_note, failed_count
+        if state.get("stop") or CAMPRUN.get(uid, {}).get("stop"):
+            return
+        username = str(acc.get("username", "") or "?")
         try:
             if state.get("stop") or CAMPRUN.get(uid, {}).get("stop"):
-                skipped_count += 1
-                last_note = "STOP requested"
                 return
-
-            ck = acc.get("cookies", {})
-            if not ck:
-                failed_count += 1
-                last_note = f"NO COOKIES | {username}"
-                return
-
-            # Decrypt cookies if they were stored encrypted
-            if _db and ck:
-                ck = decrypt_cookies(ck)
-
-            proxy = _pick_proxy()
-            check = await _verify_cookie(platform_obj, ck, proxy=proxy)
-
-            status = check.get("Status", "UNKNOWN")
-            uname = safe_text(check.get("username", "") or username)
-            if status != "LIVE":
-                failed_count += 1
-                last_note = f"{status} ({check.get('via', '-')}) {check.get('Reason', '')[:40]} | {uname}"
-                return
-
-            # Check filters
-            country = check.get("country", "")
-            try:
-                followers = int(check.get("Followers", 0) or 0)
-            except (TypeError, ValueError):
-                followers = 0
-
-            if filt.get("countries") and country not in filt["countries"]:
-                skipped_count += 1
-                last_note = f"FILTER country={country} | {uname}"
-                return
-            if filt.get("min_followers", 0) > followers:
-                skipped_count += 1
-                last_note = f"FILTER followers={followers} | {uname}"
-                return
-
-            # Post (fresh client — verify ke clients already closed hain)
-            text = random.choice(texts)
-            post_proxy = proxy if check.get("via") == "proxy" else None
-            cl = platform_obj.http_client(proxy=post_proxy)
-            try:
-                ok, post_id, err = await platform_obj.post(cl, ck, safe_text(text))
-            finally:
-                await cl.aclose()
-
-            if ok:
-                posted_count += 1
-                last_note = f"POSTED via {check.get('via', '-')} | {uname}"
-                if _db:
-                    row = {
-                        "username": uname,
-                        "fb_id": check.get("fb_id", "") if platform == "facebook" else "",
-                        "ig_id": check.get("ig_id", "") if platform == "instagram" else "",
-                        "cookies": encrypt_cookies(ck),
-                        "country": country,
-                        "followers": followers,
-                        "verified": str(check.get("Verified", "false")).lower() == "true",
-                        "status": "live",
-                        "source": "campaign",
-                        "last_post": time.time(),
-                    }
-                    table = "fb_accounts" if platform == "facebook" else "ig_accounts"
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as db_cl:
-                        await _db.upsert(db_cl, table, [row])
-            else:
-                failed_count += 1
-                last_note = f"POST FAILED: {err or 'unknown'} | {uname}"
+            await asyncio.wait_for(_do_account(acc), timeout=max(ACC_TIMEOUT, 10.0))
+        except asyncio.TimeoutError:
+            failed_count += 1
+            last_note = f"TIMEOUT ({ACC_TIMEOUT:.0f}s) | {username}"
         except Exception as e:  # noqa: BLE001
             logger.exception("campaign account failed: %s", username)
             failed_count += 1
@@ -980,29 +1417,31 @@ async def _campaign_loop(
                     {
                         "working": posted_count,
                         "dead": failed_count,
-                        "unknown": skipped_count,
+                        "unknown": skipped_count + dry_count,
                         "errors": 0,
                     },
                     last=last_note,
                 )
 
-        # Delay between accounts
-        lo, hi = cfg["delay"]
-        await asyncio.sleep(random.uniform(lo, hi))
+        # Delay between accounts (skipped after /stopcamp).
+        if not (state.get("stop") or CAMPRUN.get(uid, {}).get("stop")):
+            lo, hi = cfg["delay"]
+            await asyncio.sleep(random.uniform(min(lo, hi), max(lo, hi)))
 
     async def run_account(acc):
         async with sem:
             await process_account(acc)
 
-    # Process accounts with concurrency limit
     await asyncio.gather(*(run_account(acc) for acc in accounts), return_exceptions=True)
 
     summary = (
-        f"Campaign complete!\n"
+        f"Campaign complete! ({prog_total} accounts)\n"
         f"Posted: {posted_count}\n"
         f"Failed: {failed_count}\n"
+        f"Unsupported (token/media missing): {unsupported_count}\n"
         f"Skipped (filter): {skipped_count}\n"
-        f"Total: {prog_total}"
+        f"Dry run: {dry_count}\n"
+        f"Unprocessed/stopped: {prog_total - done_count}"
     )
     if update is not None:
         await update.message.reply_text(summary)
@@ -1020,164 +1459,267 @@ async def _campaign_loop(
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle cookie file uploads for rework/verify/campaign."""
     uid = update.effective_user.id
+    if not await _require_admin(update):
+        return
+    if not check_user_rate_limit(uid):
+        await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
+        return
+
     doc = update.message.document
     if not doc:
         return
-
-    state = user_state.get(uid, {})
-    mode = state.get("mode", "rework")
 
     if not doc.file_name or not doc.file_name.lower().endswith((".txt", ".zip")):
         await update.message.reply_text("Sirf .txt ya .zip file bhejo.")
         return
 
-    msg = await update.message.reply_text("File process ho rahi hai...")
+    state = user_state.get(uid)
+    if not state:
+        await update.message.reply_text(
+            "Pehle mode select karo: /rework, /verify, ya /camp start."
+        )
+        return
 
-    # Clean up expired user state entries
+    mode = state.get("mode", "rework")
+    if mode == "campaign":
+        cfg = CAMPS.get(uid)
+        if not cfg or not cfg.get("texts") or not cfg.get("platform"):
+            await update.message.reply_text(
+                "Campaign adhoora hai: /camp platform + /camp text complete karo, phir /camp start."
+            )
+            return
+
+    msg = await update.message.reply_text("File download ho rahi hai...")
     cleanup_user_state()
 
-    # Check if proxies are configured - without them all traffic goes direct
-    if not load_proxies():
-        await msg.edit_text(
-            "⚠️ No proxies configured! All Facebook/Instagram traffic will go direct.\n"
-            "Add proxies with /proxy add before uploading cookies."
-        )
+    has_proxy = bool(get_active_proxies())
+    no_proxy_note = "" if has_proxy else " | ⚠️ proxy OFF (direct traffic)"
 
     tmp = tempfile.mkdtemp(prefix="sm_")
     try:
         file = await context.bot.get_file(doc.file_id)
-        path = os.path.join(tmp, doc.file_name)
+        path = os.path.join(tmp, os.path.basename(doc.file_name))
         await file.download_to_drive(path)
 
-        # MIME type validation using filetype (pure Python, no libmagic needed)
-        kind = filetype.guess(path)
-        if kind is None:
-            await msg.edit_text("Invalid file type. Only .txt and .zip files are allowed.")
-            return
-        mime = kind.mime
-        if mime not in ("application/zip", "text/plain"):
-            await msg.edit_text("Invalid file type. Only .txt and .zip files are allowed.")
-            return
+        is_zip = doc.file_name.lower().endswith(".zip")
+        if is_zip:
+            if not _zipfile.is_zipfile(path):
+                await msg.edit_text("Invalid zip file.")
+                return
+        else:
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    fh.read(1)
+            except OSError:
+                await msg.edit_text("File read nahi ho saki.")
+                return
 
         results = []
         progress_counts = {"working": 0, "dead": 0, "unknown": 0, "errors": 0}
 
-        if doc.file_name.lower().endswith(".zip"):
+        def error_result(name: str, raw: str, exc: Exception):
+            detail = (
+                "REWORK ERROR\n"
+                f"File: {name}\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                "--- first 500 chars ---\n"
+                + (raw[:500] if raw else "(file empty)")
+            )
+            return (name, detail, f"ERROR: {type(exc).__name__}", {}, {})
+
+        async def process_entry(name: str, raw: str):
+            try:
+                return await _process_one(name, raw, state)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("process failed: %s", name)
+                return error_result(name, raw, e)
+
+        def record(result, processed: int):
+            results.append(result)
+            folder = _status_folder(result[2])
+            progress_counts[folder] += 1
+            meta = result[4] if len(result) > 4 else {}
+            who = str(meta.get("Username", "") or safe_zip_entry_name(result[0]))
+            extra = f" | ID {meta.get('ID')}" if meta.get("ID") else ""
+            via = f" | via {meta.get('Via')}" if meta.get("Via") else ""
+            return who, f"{result[2]}{via}{extra} | {safe_zip_entry_name(result[0])}"
+
+        if is_zip:
             with _zipfile.ZipFile(path) as z:
-                names = [n for n in z.namelist() if n.lower().endswith(".txt")]
-                # Zip bomb protection: check total uncompressed size
-                total_uncompressed = sum(z.getinfo(n).file_size for n in names)
+                infos = [
+                    i for i in z.infolist()
+                    if not i.is_dir() and i.filename.lower().endswith(".txt")
+                ]
+                total_uncompressed = sum(i.file_size for i in infos)
                 if total_uncompressed > ZIP_MAX_TOTAL:
                     await msg.edit_text(
-                        f"Zip bomb detected: total uncompressed size {total_uncompressed // (1024*1024)}MB "
-                        f"exceeds limit {ZIP_MAX_TOTAL // (1024*1024)}MB"
+                        f"Zip bomb detected: total uncompressed size "
+                        f"{total_uncompressed // (1024 * 1024)}MB exceeds limit "
+                        f"{ZIP_MAX_TOTAL // (1024 * 1024)}MB"
                     )
                     return
-                names = names[:MAX_FILES]
+
+                total_found = len(infos)
+                truncated = total_found > MAX_FILES
+                infos = infos[:MAX_FILES]
+
                 live_on = bool(state.get("live") or mode == "verify")
                 reporter = ProgressReporter(
                     msg,
-                    f"\U0001F4E6 {mode.upper()} processing" + (" + live verify" if live_on else ""),
-                    len(names),
+                    f"\U0001F4E6 {mode.upper()} processing"
+                    + (" + live verify" if live_on else ""),
+                    len(infos),
                 )
-                await reporter.update(0, progress_counts, last="shuru ho raha hai...", force=True)
-                for i, name in enumerate(names, 1):
-                    await reporter.update(
-                        i - 1,
-                        progress_counts,
-                        current=safe_zip_entry_name(name),
-                        last="checking...",
-                    )
-                    raw = z.read(name).decode("utf-8", "ignore")
-                    try:
-                        result = await _process_one(name, raw, state)
-                    except Exception as e:  # noqa: BLE001
-                        logger.exception("process failed: %s", name)
-                        detail = (
-                            "REWORK ERROR\n"
-                            f"File: {name}\n"
-                            f"{type(e).__name__}: {e}\n\n"
-                            "--- first 500 chars ---\n"
-                            + (raw[:500] if raw else "(file empty)")
+                await reporter.update(
+                    0,
+                    progress_counts,
+                    last=f"shuru ho raha hai... ({total_found} files)"
+                    + (f" — sirf pehli {MAX_FILES}" if truncated else ""),
+                    force=True,
+                )
+
+                processed = 0
+                batch_size = max(CONCURRENCY * 4, 32) if live_on else 1
+                for start in range(0, len(infos), batch_size):
+                    batch = infos[start:start + batch_size]
+                    raws = []
+                    for info in batch:
+                        name = info.filename
+                        if info.file_size > ZIP_MAX_FILE:
+                            processed += 1
+                            who, note = record(
+                                (
+                                    name,
+                                    "REWORK ERROR\n"
+                                    f"File: {name}\n"
+                                    f"Entry too large: {info.file_size} bytes "
+                                    f"(limit {ZIP_MAX_FILE})\n",
+                                    "ERROR: ZipEntryTooLarge",
+                                    {},
+                                    {},
+                                ),
+                                processed,
+                            )
+                            await reporter.update(processed, progress_counts, current=who, last=note)
+                            continue
+                        try:
+                            raw = z.read(info).decode("utf-8", "ignore")
+                        except Exception as e:  # noqa: BLE001
+                            processed += 1
+                            who, note = record(error_result(name, "", e), processed)
+                            await reporter.update(processed, progress_counts, current=who, last=note)
+                            continue
+                        raws.append((name, raw))
+
+                    if not raws:
+                        continue
+
+                    if live_on:
+                        await reporter.update(
+                            processed,
+                            progress_counts,
+                            current=f"{len(raws)} files in parallel...",
+                            last="checking...",
                         )
-                        result = (name, detail, f"ERROR: {type(e).__name__}", {}, {})
-                    results.append(result)
-                    folder = _status_folder(result[2])
-                    progress_counts[folder] += 1
-                    _meta = result[4] if len(result) > 4 else {}
-                    who = str(_meta.get("Username", "") or safe_zip_entry_name(name))
-                    extra = f" | ID {_meta.get('ID')}" if _meta.get("ID") else ""
-                    via = f" | via {_meta.get('Via')}" if _meta.get("Via") else ""
+                        tasks = [asyncio.create_task(process_entry(n, r)) for n, r in raws]
+                        for finished in asyncio.as_completed(tasks):
+                            result = await finished
+                            processed += 1
+                            who, note = record(result, processed)
+                            await reporter.update(processed, progress_counts, current=who, last=note)
+                    else:
+                        for name, raw in raws:
+                            result = await process_entry(name, raw)
+                            processed += 1
+                            who, note = record(result, processed)
+                            await reporter.update(processed, progress_counts, current=who, last=note)
+
+                if processed:
                     await reporter.update(
-                        i,
+                        processed,
                         progress_counts,
-                        current=who,
-                        last=f"{result[2]}{via}{extra} | {safe_zip_entry_name(name)}",
+                        current="",
+                        last=f"zip complete | {processed} files",
+                        force=True,
                     )
         else:
-            with open(path, encoding="utf-8", errors="ignore") as f:
-                raw = f.read()
-            try:
-                result = await _process_one(doc.file_name, raw, state)
-            except Exception as e:  # noqa: BLE001
-                logger.exception("process failed: %s", doc.file_name)
-                detail = (
-                    "REWORK ERROR\n"
-                    f"File: {doc.file_name}\n"
-                    f"{type(e).__name__}: {e}\n\n"
-                    "--- first 500 chars ---\n"
-                    + (raw[:500] if raw else "(file empty)")
-                )
-                result = (doc.file_name, detail, f"ERROR: {type(e).__name__}", {}, {})
-            results.append(result)
-            progress_counts[_status_folder(result[2])] += 1
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                raw = fh.read()
+            result = await process_entry(doc.file_name, raw)
+            record(result, 1)
 
         # If campaign mode, run campaign loop
-        if mode == "campaign" and state.get("platform"):
+        if mode == "campaign":
             cfg = CAMPS.get(uid)
-            if cfg and cfg.get("texts"):
-                accounts = []
-                for name, _out, _status, cookies, meta in results:
-                    if not cookies:
-                        continue
-                    uname = str(meta.get("Username", "") or safe_zip_entry_name(name))
-                    accounts.append({"username": uname, "cookies": cookies})
-                await msg.edit_text(f"Campaign shuru: {len(accounts)} accounts")
-                CAMPRUN[uid] = {"stop": False}
-                try:
-                    await _campaign_loop(uid, cfg, accounts, CAMPRUN[uid], update=update, progress_msg=msg)
-                finally:
-                    CAMPRUN.pop(uid, None)
-            else:
-                await update.message.reply_text("Campaign configs missing. /camp text bhejo pehle.")
-        else:
-            # Create output zip for rework/verify mode
-            out_path = os.path.join(tmp, "out.zip")
-            counts = progress_counts
-            with _zipfile.ZipFile(out_path, "w", _zipfile.ZIP_DEFLATED) as zout:
-                for name, output, status, *_ in results:
-                    folder = _status_folder(status)
-                    # Path traversal protection: use basename only
-                    safe_name = safe_zip_entry_name(name)
-                    zout.writestr(f"{folder}/{safe_name}", output)
+            accounts = []
+            for name, _out, _status, cookies, meta in results:
+                if not cookies:
+                    continue
+                uname = str(
+                    meta.get("Username")
+                    or meta.get("ID")
+                    or safe_zip_entry_name(name)
+                )
+                accounts.append({
+                    "username": uname,
+                    "cookies": cookies,
+                    "country": meta.get("Country", ""),
+                    "followers": _to_int(meta.get("Followers")),
+                    "verified": str(meta.get("Verified", "")).lower() == "true",
+                    "access_token": "",
+                    "target_id": str(meta.get("ID", "")),
+                })
+            if cfg and cfg.get("limit"):
+                accounts = accounts[: cfg["limit"]]
 
-            summary = (
-                f"Rework complete | {len(results)} files\n"
-                f"working: {counts['working']} | dead: {counts['dead']} | "
-                f"unknown: {counts['unknown']} | errors: {counts['errors']}\n"
-                f"Live check: {'ON' if (state.get('live') or mode == 'verify') else 'OFF (/live on)'}"
-            )
+            if not accounts:
+                await msg.edit_text("Campaign: koi valid cookies nahi mili.")
+                return
+
+            await msg.edit_text(f"Campaign shuru: {len(accounts)} accounts")
+            CAMPRUN[uid] = {"stop": False}
+            try:
+                await _campaign_loop(uid, cfg, accounts, CAMPRUN[uid], update=update, progress_msg=msg)
+            finally:
+                CAMPRUN.pop(uid, None)
+            return
+
+        # Create output zip for rework/verify mode
+        out_path = os.path.join(tmp, "out.zip")
+        used = set()
+        with _zipfile.ZipFile(out_path, "w", _zipfile.ZIP_DEFLATED) as zout:
+            for name, output, status, *_ in results:
+                folder = _status_folder(status)
+                safe_name = safe_zip_entry_name(name) or "cookie.txt"
+                if safe_name in used:
+                    stem, ext = os.path.splitext(safe_name)
+                    idx = 2
+                    while f"{stem}__{idx}{ext}" in used:
+                        idx += 1
+                    safe_name = f"{stem}__{idx}{ext}"
+                used.add(safe_name)
+                zout.writestr(f"{folder}/{safe_name}", output)
+
+        live_state = state.get("live") or mode == "verify"
+        summary = (
+            f"{mode.upper()} complete | {len(results)} files\n"
+            f"working: {progress_counts['working']} | dead: {progress_counts['dead']} | "
+            f"unknown: {progress_counts['unknown']} | errors: {progress_counts['errors']}\n"
+            f"Live check: {'ON' if live_state else 'OFF (/live on)'} | "
+            f"DB: {'ON' if _db else 'OFF'}{no_proxy_note}"
+        )
+        with open(out_path, "rb") as fh:
             await context.bot.send_document(
                 update.effective_chat.id,
-                document=open(out_path, "rb"),
-                filename="reworked.zip",
+                document=fh,
+                filename=f"reworked_{int(time.time())}.zip",
                 caption=summary,
             )
-            await msg.edit_text(summary)
+        await msg.edit_text(summary)
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.exception("handle_file")
-        await msg.edit_text("File process karne mein error aaya. Dobara try karein.")
+        await msg.edit_text(f"File process karne mein error aaya: {type(e).__name__}: {e}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1210,6 +1752,7 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
 
     results = []
     final = None
+    dead_result = None
     last_error = None
 
     for label, cl in routes:
@@ -1224,12 +1767,26 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
 
         check["via"] = label
         results.append(check)
+        status = check.get("Status")
 
-        if check.get("Status") == "LIVE":
+        if status == "LIVE":
             return check
-        if check.get("Status") == "DEAD":
-            return check
+        if status == "DEAD":
+            # Proxy ka DEAD false positive ho sakta hai (IP/region block).
+            # Direct route available ho to confirm karo.
+            if label == "direct" or not VERIFY_CONFIRM_DEAD:
+                return check
+            dead_result = check
+            continue
+
         final = check
+
+    if dead_result is not None:
+        if len(results) > 1:
+            dead_result["Reason"] = " | ".join(
+                f"{r.get('via')}: {r.get('Status')}/{r.get('Reason', '')}" for r in results
+            )
+        return dead_result
 
     if final:
         # Dono routes UNKNOWN (network/proxy glitch) — thoda wait karke ek aur try
@@ -1268,20 +1825,16 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
 
 async def _process_one(name: str, raw: str, state: dict) -> tuple:
     """Process a single cookie file."""
-    name_lower = name.lower()
-    if "instagram" in name_lower or "ig" in name_lower:
-        platform = "instagram"
-    elif "facebook" in name_lower or "fb" in name_lower:
-        platform = "facebook"
-    else:
-        platform = state.get("platform", "instagram")
+    platform = _detect_platform_from_name(name)
+    if not platform:
+        platform = state.get("platform") or "instagram"
 
     platform_obj = get_platform(platform)
     bp = BasePlatform()
-    _, cookies = bp.parse_cookie_file(raw)
+    cookie_data, cookie_lines = bp.parse_cookie_file(raw)
     meta = parse_meta(raw, name)
 
-    if not cookies:
+    if not cookie_lines:
         detail = (
             "NO COOKIES FOUND\n"
             f"File: {name}\n"
@@ -1293,73 +1846,102 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
         return (name, detail, "NOCOOKIES", {}, {})
 
     # Live check if enabled — proxy + direct dono routes try hote hain
-    want_live = state.get("live", False) or state.get("mode") == "verify"
+    want_live = bool(state.get("live")) or state.get("mode") == "verify"
+    check: Dict[str, Any] = {}
     if want_live and platform_obj:
-        proxy = _pick_proxy()
-        check = await _verify_cookie(platform_obj, cookies, proxy=proxy)
+        check = await _verify_cookie(platform_obj, cookie_data, proxy=_pick_proxy())
         status = check.get("Status", "UNKNOWN")
-        reason = check.get("Reason", "")
-        meta.update(check)
-    else:
+        merge_check_meta(meta, check, platform)
+    elif want_live:
         status = "UNKNOWN"
-        reason = "live check off (rework only)"
+    else:
+        status = "REWORKED"
 
     meta.update({
         "Status": status,
-        "Reason": reason,
+        "Reason": check.get("Reason", "" if want_live else "live check off (rework only)"),
         "Platform": platform,
         "Checked": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     })
-    output = build_cookie_file(meta, cookies)
+    if check.get("via"):
+        meta["Via"] = str(check["via"])
+    output = build_cookie_file(meta, cookie_lines)
 
-    # Save LIVE accounts to DB
-    if status == "LIVE" and _db:
+    # Save every verified result (LIVE/DEAD/UNKNOWN) so /db stats and
+    # /db reverify see reality. Rework-only runs (no live check) are not saved.
+    if want_live and _db:
         table = "fb_accounts" if platform == "facebook" else "ig_accounts"
-        encrypted_cookies = encrypt_cookies(cookies)
         norm = _norm_meta(meta)
-        try:
-            followers = int(str(norm.get("Followers", "0")).split()[0])
-        except (ValueError, IndexError):
-            followers = 0
-        row = {
-            "username": norm.get("Username", ""),
-            "fb_id": norm.get("ID", "") if platform == "facebook" else "",
-            "ig_id": norm.get("ID", "") if platform == "instagram" else "",
-            "cookies": encrypted_cookies,
-            "country": norm.get("Country", ""),
-            "followers": followers,
-            "verified": str(norm.get("Verified", "false")).lower() == "true",
-            "status": "live",
-            "source": "bot",
-        }
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as cl:
-            await _db.upsert(cl, table, [row])
+        username = str(norm.get("Username", "") or norm.get("ID", "") or "").strip()
+        if not username:
+            logger.warning("DB save skipped (no username/ID): %s", name)
+        else:
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            row = {
+                "username": username,
+                "fb_id": str(norm.get("ID", "")) if platform == "facebook" else "",
+                "ig_id": str(norm.get("ID", "")) if platform == "instagram" else "",
+                "cookies": encrypt_cookies(cookie_data),
+                "country": norm.get("Country", ""),
+                "followers": _to_int(norm.get("Followers")),
+                "verified": str(norm.get("Verified", "false")).lower() == "true",
+                "status": status.lower(),
+                "source": "verify",
+                "last_check": now,
+            }
+            if status == "LIVE":
+                row["last_ok"] = now
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as cl:
+                    saved, db_err = await _db.upsert(cl, table, [row])
+                if not saved:
+                    logger.warning("DB save failed for %s (%s): %s", name, table, db_err)
+            except Exception:  # noqa: BLE001
+                logger.exception("DB save failed for %s", name)
 
-    return (name, output, status, cookies, meta)
+    return (name, output, status, cookie_data, meta)
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not await _require_admin(update):
+        return
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
+    stopped = False
+    if uid in CAMPRUN:
+        CAMPRUN[uid]["stop"] = True
+        stopped = True
     user_state.pop(uid, None)
-    await update.message.reply_text("Cancel / reset.")
-    await audit_log(uid, "cancel", {})
+    cfg = CAMPS.get(uid)
+    if cfg:
+        cfg["stage"] = "idle"
+        save_camp(uid)
+    await update.message.reply_text(
+        "Cancel / reset." + (" Campaign stop signal bhej diya." if stopped else "")
+    )
+    await audit_log(uid, "cancel", {"stopped_campaign": stopped})
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages for campaign variant collection."""
     uid = update.effective_user.id
+    if not _is_admin(uid):
+        return
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
 
+    cfg = CAMPS.get(uid)
     state = user_state.get(uid, {})
-    if not state or state.get("mode") != "campaign" or state.get("stage") != "text":
+    in_text_stage = (
+        state.get("mode") == "campaign" and state.get("stage") == "text"
+    ) or (cfg is not None and cfg.get("stage") == "text")
+
+    if not in_text_stage:
         return
 
-    cfg = CAMPS.get(uid)
     if not cfg:
         await update.message.reply_text("Campaign not found. Use /camp new to create one.")
         return
@@ -1371,4 +1953,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cfg["texts"].append(text)
     save_camp(uid)
-    await update.message.reply_text(f"Variant {len(cfg['texts'])} added: {safe_text(text, 80)}...")
+    await update.message.reply_text(
+        f"Variant {len(cfg['texts'])} added: {safe_text(text, 80)}\n"
+        "/camp idle se text mode band karo, /camp start se campaign shuru."
+    )
+
+
+async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect campaign media (stored as Telegram file ids only)."""
+    uid = update.effective_user.id
+    if not _is_admin(uid):
+        return
+    cfg = CAMPS.get(uid)
+    state = user_state.get(uid, {})
+    if not cfg or not (
+        (state.get("mode") == "campaign" and state.get("stage") == "media")
+        or cfg.get("stage") == "media"
+    ):
+        return
+
+    msg = update.message
+    if msg.photo:
+        entry = {"type": "photo", "file_id": msg.photo[-1].file_id}
+    elif msg.video:
+        entry = {"type": "video", "file_id": msg.video.file_id}
+    else:
+        return
+
+    cfg["media"].append(entry)
+    save_camp(uid)
+    await msg.reply_text(
+        f"Media {len(cfg['media'])} added ({entry['type']}).\n"
+        "Note: Graph API ko public URL chahiye hota hai; file_id se direct post nahi hota."
+    )

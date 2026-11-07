@@ -1,28 +1,33 @@
 """Entry point for Social Markhors Bot."""
 
 import asyncio
+import json
 import logging
 import os
 import sys
 
-# Add project root to path so config package can be found
+# .env MUST be loaded before config.settings is imported (settings reads env at
+# import time; ENCRYPTION_KEY validation would otherwise exit on local runs).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
-from config.settings import (
+load_dotenv()
+
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters  # noqa: E402
+
+from config.settings import (  # noqa: E402
     ADMIN_IDS,
     BOT_TOKEN,
-    CREDIT,
+    BOT_VERSION,
     HEALTH_CHECK_HOST,
     HEALTH_CHECK_PORT,
     NETCHECK_ON_START,
     SUPABASE_KEY,
     SUPABASE_URL,
-    WEBSITE,
 )
-from src.bot import (
+from src.bot import (  # noqa: E402
+    CAMPRUN,
     cancel_cmd,
     camp_cmd,
     db_cmd,
@@ -32,78 +37,78 @@ from src.bot import (
     init_db,
     init_platforms,
     live_cmd,
+    load_camps,
     netcheck_cmd,
+    on_media,
     on_text,
     proxy_cmd,
     rework_cmd,
+    run_netcheck,
     start,
     status_cmd,
     stopcamp_cmd,
     verify_cmd,
 )
-from src.utils.proxy import check_proxy_readiness, load_proxies
+from src.utils.proxy import check_proxy_readiness, load_proxies  # noqa: E402
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": "%(message)s"}',
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
 logger = logging.getLogger(__name__)
+
+
+class JsonFormatter(logging.Formatter):
+    """JSON log lines that stay valid even when messages contain quotes."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "time": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 
 _health_server = None
 
 
-def _is_admin_ip(host: str) -> bool:
-    """Check if request comes from localhost or admin IP."""
-    if host in ("127.0.0.1", "localhost", "::1"):
-        return True
-    return False
-
-
 async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Simple HTTP health check endpoint - localhost only."""
+    """Minimal HTTP health endpoint (no secrets, safe for any peer)."""
     try:
         data = await reader.read(1024)
         if not data:
-            writer.close()
             return
         request_line = data.split(b"\n")[0].decode("utf-8", errors="ignore")
         parts = request_line.split()
-        method = parts[0] if len(parts) > 0 else ""
+        method = parts[0] if parts else ""
         path = parts[1] if len(parts) > 1 else ""
 
-        if method == "GET" and path == "/healthz":
-            body = b'{"status":"ok"}'
+        if method in ("GET", "HEAD") and path.split("?")[0] in ("/healthz", "/"):
+            body = json.dumps(
+                {"status": "ok", "bot": "social-markhors", "version": BOT_VERSION}
+            ).encode()
             response = (
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: application/json\r\n"
                 b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-                b"Connection: close\r\n"
-                b"\r\n"
-                + body
+                b"Connection: close\r\n\r\n" + body
             )
         else:
             response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
-        # Only allow localhost connections for health check
-        peername = writer.get_extra_info("peername")
-        host = peername[0] if peername else ""
-        if host not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
-            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
-            return
-
         writer.write(response)
         await writer.drain()
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     finally:
         try:
             writer.close()
             await writer.wait_closed()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
 
@@ -111,13 +116,14 @@ async def start_health_server():
     """Start HTTP health check server if HEALTH_CHECK_PORT is set."""
     global _health_server
     if HEALTH_CHECK_PORT <= 0:
+        logger.info("Health check server disabled (HEALTH_CHECK_PORT=0)")
         return
     try:
         _health_server = await asyncio.start_server(
             _health_handler, HEALTH_CHECK_HOST, HEALTH_CHECK_PORT
         )
-        logger.info(f"Health check server on {HEALTH_CHECK_HOST}:{HEALTH_CHECK_PORT}")
-    except Exception:
+        logger.info("Health check server on %s:%s", HEALTH_CHECK_HOST, HEALTH_CHECK_PORT)
+    except Exception:  # noqa: BLE001
         logger.exception("Health check server failed to start")
 
 
@@ -128,48 +134,44 @@ async def stop_health_server():
         _health_server.close()
         try:
             await _health_server.wait_closed()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
         _health_server = None
 
 
 async def post_init(app):
-    """Initialize DB and platforms after bot starts."""
-    # Initialize DB
+    """Initialize DB, platforms, campaigns, proxies and health server."""
     db = init_db(SUPABASE_URL, SUPABASE_KEY)
     if db:
         logger.info("Supabase DB initialized")
+    else:
+        logger.warning("Supabase DB OFF (SUPABASE_URL / SUPABASE_KEY missing)")
 
-    # Initialize platforms
     init_platforms()
+    load_camps()
     logger.info("Platforms initialized (Facebook, Instagram)")
 
-    # Load proxies
     proxy_count = len(load_proxies())
-    logger.info(f"Proxies loaded: {proxy_count}")
-
-    # Check proxy readiness
-    proxy_warnings = check_proxy_readiness()
-    for w in proxy_warnings:
+    logger.info("Proxies loaded: %s", proxy_count)
+    for w in check_proxy_readiness():
         logger.warning(w)
 
-    # Start health check server
     await start_health_server()
 
     if NETCHECK_ON_START:
-        logger.info("Netcheck on start enabled")
+        try:
+            report = await run_netcheck()
+            logger.info("startup netcheck:\n%s", report)
+        except Exception:  # noqa: BLE001
+            logger.exception("startup netcheck failed")
 
 
 async def post_shutdown(app):
-    """Graceful shutdown: close health server, cancel running tasks."""
+    """Graceful shutdown: stop campaigns, close health server."""
     logger.info("Bot shutting down...")
-
-    # Stop health server
-    await stop_health_server()
-
-    # Cancel running campaigns
-    for uid, state in CAMPRUN.items():
+    for state in CAMPRUN.values():
         state["stop"] = True
+    await stop_health_server()
 
 
 def main():
@@ -189,7 +191,6 @@ def main():
         .build()
     )
 
-    # Command handlers
     handlers = [
         ("start", start),
         ("help", help_cmd),
@@ -208,19 +209,16 @@ def main():
     for cmd, fn in handlers:
         app.add_handler(CommandHandler(cmd, fn))
 
-    # Document handler for cookie file uploads
-    app.add_handler(
-        MessageHandler(filters.Document.ALL, handle_file)
-    )
+    # Cookie zip/txt uploads
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    # Campaign media collection
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, on_media))
     # Text handler for campaign text collection
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, on_text)
-    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    logger.info("Social Markhors Bot running | admins: %s", len(ADMIN_IDS))
+    logger.info("Social Markhors Bot v%s running | admins: %s", BOT_VERSION, len(ADMIN_IDS))
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    load_dotenv()
     main()

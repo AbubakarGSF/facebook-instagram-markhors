@@ -3,9 +3,11 @@
 Same logic as evilmarkhors bot: PROXIES env, PROXY_TYPE, PROXY_FILE, /proxy add support.
 """
 
+import asyncio
 import logging
 import os
 import re
+import time
 from typing import List, Optional, Tuple
 
 import httpx
@@ -203,12 +205,78 @@ def load_proxies() -> List[str]:
 
 def proxy_status_text() -> str:
     if PROXY_DISABLED and PROXIES:
-        return f"Proxy: OFF (/proxy off) | {len(PROXIES)} configured\n/proxy on se wapas ON"
+        return f"Proxy: OFF (/proxy on) | {len(PROXIES)} configured"
     if not PROXIES:
-        return "Proxy: OFF (PROXIES khaali)"
+        return "Proxy: OFF (PROXIES khaali) — /proxy add host:port:user:pass"
     lines = [f"Proxy: ON ({len(PROXIES)})", "Traffic only | Telegram + Supabase direct"]
-    lines += [f"{i + 1}. {p}" for i, p in enumerate(PROXIES[:40])]
+    lines += [f"{i + 1}. {mask_proxy(p)}" for i, p in enumerate(PROXIES[:40])]
+    if len(PROXIES) > 40:
+        lines.append(f"... +{len(PROXIES) - 40} more")
     return "\n".join(lines)
+
+
+def mask_proxy(proxy_url: str) -> str:
+    """Hide proxy credentials before showing them in chat/logs."""
+    try:
+        u = httpx.URL(proxy_url)
+        if u.username or u.password:
+            return str(u.copy_with(username="***", password="***"))
+    except Exception:  # noqa: BLE001
+        pass
+    return mask_sensitive(proxy_url)
+
+
+def get_active_proxies() -> List[str]:
+    """Proxies that may actually be used right now (respects /proxy off)."""
+    if PROXY_DISABLED:
+        return []
+    return list(PROXIES or load_proxies())
+
+
+def set_proxy_enabled(enabled: bool) -> None:
+    global PROXY_DISABLED
+    PROXY_DISABLED = not enabled
+
+
+def add_proxy(entry: str) -> Tuple[bool, str]:
+    """Add a proxy at runtime and persist it in proxies.txt.
+
+    Returns (ok, normalized_url_or_error).
+    """
+    url = norm_proxy(entry)
+    if not url:
+        return False, "invalid proxy format"
+    if url in PROXIES:
+        return True, url
+    try:
+        with open(RUNTIME_PROXY_FILE, "a", encoding="utf-8") as fh:
+            fh.write(entry.strip() + "\n")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not persist proxy to %s: %s", RUNTIME_PROXY_FILE, e)
+    PROXIES.append(url)
+    return True, url
+
+
+async def test_proxies(limit: int = 10) -> List[str]:
+    """Quick reachability test; returns per-proxy result lines (masked)."""
+    async def probe(url: str) -> str:
+        started = time.time()
+        try:
+            async with httpx.AsyncClient(
+                proxy=url, timeout=httpx.Timeout(8.0), trust_env=False
+            ) as client:
+                r = await client.get("https://api.ipify.org?format=json")
+                ms = (time.time() - started) * 1000
+                if r.status_code == 200:
+                    return f"OK   {mask_proxy(url)} ({ms:.0f}ms)"
+                return f"FAIL {mask_proxy(url)} (HTTP {r.status_code})"
+        except Exception as e:  # noqa: BLE001
+            return f"FAIL {mask_proxy(url)} ({type(e).__name__})"
+
+    proxies = get_active_proxies()[:limit]
+    if not proxies:
+        return ["Koi proxy configured nahi."]
+    return list(await asyncio.gather(*(probe(p) for p in proxies)))
 
 
 def mask_sensitive(text: str) -> str:

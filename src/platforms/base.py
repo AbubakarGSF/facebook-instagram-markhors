@@ -13,6 +13,17 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# HTTP header / metadata keys that are never cookies.
+SKIP_KEYS = {
+    "cookie", "set-cookie", "user-agent", "accept", "accept-language",
+    "accept-encoding", "referer", "referrer", "origin", "host",
+    "content-type", "content-length", "authorization", "connection",
+    "domain", "path", "expires", "max-age", "secure", "httponly",
+    "samesite", "status", "username", "name", "id", "country",
+    "followers", "friends", "posts", "likes", "media", "verified",
+    "email", "phone", "platform", "checked", "reason", "via",
+}
+
 
 class BasePlatform:
     """Every platform (facebook, instagram) inherits from this."""
@@ -92,7 +103,7 @@ class BasePlatform:
                     cookies.append(cookie)
                 continue
 
-            # key=value or key: value (strict — header lines aur URLs skip)
+            # key=value or key: value (strict — headers, URLs aur metadata skip)
             m = re.match(r"^([A-Za-z0-9_.\-]{1,60})\s*(=|:)\s*(.+)$", line)
             if not m:
                 continue
@@ -100,6 +111,8 @@ class BasePlatform:
             sep = m.group(2)
             v = m.group(3).strip().strip('"').strip("'")
             if not k or not v or k in seen:
+                continue
+            if k.lower() in SKIP_KEYS:
                 continue
             if sep == ":" and (v.startswith("//") or " " in v):
                 continue
@@ -117,13 +130,17 @@ class BasePlatform:
         return await self._check_with_retries(client, cookies, retries=self.retries)
 
     async def _check_with_retries(self, client: httpx.AsyncClient, cookies: Dict[str, str], retries: int = 3) -> Dict[str, Any]:
-        """Run live_check with exponential backoff retries."""
+        """Run live_check with exponential backoff retries.
+
+        Only UNKNOWN (network/HTTP glitch) is retried. LIVE and DEAD are
+        definitive answers, so retrying them just wastes seconds per account.
+        """
         last_result = None
         for attempt in range(retries):
             try:
                 result = await self._check_single(client, cookies)
             except Exception as e:
-                logging.exception(f"live_check exception on attempt {attempt + 1}: {e}")
+                logging.exception("live_check exception on attempt %s: %s", attempt + 1, e)
                 result = {
                     "Status": "UNKNOWN",
                     "Platform": self.__class__.__name__,
@@ -131,15 +148,18 @@ class BasePlatform:
                 }
 
             last_result = result
-
-            # If LIVE, return immediately
-            if result.get("Status") == "LIVE":
+            status = result.get("Status")
+            if status in ("LIVE", "DEAD"):
                 return result
 
-            # If not last attempt, wait before retry
             if attempt < retries - 1:
-                wait_time = min(2 ** attempt, 30)  # Exponential backoff: 1s, 2s, 4s... max 30s
-                self.logger.info(f"Verify attempt {attempt + 1} failed: {result.get('Reason', 'unknown')}. Retrying in {wait_time}s...")
+                wait_time = min(2 ** attempt, 30)
+                self.logger.info(
+                    "Verify attempt %s unknown (%s). Retrying in %ss...",
+                    attempt + 1,
+                    result.get("Reason", "unknown"),
+                    wait_time,
+                )
                 await asyncio.sleep(wait_time)
 
         return last_result or {"Status": "UNKNOWN", "Platform": self.__class__.__name__, "Reason": "all retries failed"}
@@ -151,57 +171,3 @@ class BasePlatform:
     async def live_check_impl(self, client: httpx.AsyncClient, cookies: Dict[str, str]) -> Dict[str, Any]:
         """Actual implementation - subclasses must implement this."""
         raise NotImplementedError
-
-    async def _run_check(self, client: httpx.AsyncClient, cookies: Dict[str, str], retries: int = 2) -> Optional[Dict[str, Any]]:
-        """Run a check and swallow exceptions so the fallback can continue."""
-        try:
-            return await self._check_with_retries(client, cookies, retries=retries)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("%s check failed: %s", self.NAME, e)
-            return None
-
-    async def check_with_fallback(
-        self,
-        client_direct: Optional[httpx.AsyncClient],
-        client_proxy: Optional[httpx.AsyncClient],
-        cookies: Dict[str, str],
-        proxy_url: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Try direct first, then proxy (ya ulta), best result return karo.
-
-        Order:
-          - proxy available ho to pehle proxy (asli target wahi hai), phir direct.
-          - proxy fail ho jaye network-wise to direct fallback (Railway IP).
-        """
-        last: Optional[Dict[str, Any]] = None
-
-        candidates = []
-        if client_proxy is not None:
-            candidates.append(("proxy", client_proxy))
-        if client_direct is not None:
-            candidates.append(("direct", client_direct))
-
-        for label, client in candidates:
-            result = await self._run_check(client, cookies, retries=2)
-            if not result:
-                continue
-            if result.get("Status") == "LIVE":
-                result["via"] = label
-                return result
-            if result.get("Status") == "DEAD":
-                # Cookie genuinely dead — dusra route try karne ka faida nahi.
-                result["via"] = label
-                return result
-            last = result
-
-        if last:
-            last.setdefault("via", "none")
-            last["Reason"] = f"all routes failed: {last.get('Reason', 'unknown')}"
-            return last
-
-        return {
-            "Status": "UNKNOWN",
-            "Platform": self.NAME,
-            "Reason": "both direct and proxy failed",
-            "via": "none",
-        }

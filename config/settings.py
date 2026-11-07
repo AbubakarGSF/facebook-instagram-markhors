@@ -10,7 +10,16 @@ logger = logging.getLogger(__name__)
 
 def _env_list(name: str, default: str = "") -> Set[int]:
     raw = os.getenv(name, default).strip()
-    return {int(x) for x in raw.split(",") if x.strip()}
+    ids: Set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logger.warning("Ignoring invalid id in %s: %r", name, part)
+    return ids
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN")
@@ -36,7 +45,8 @@ PROXY_TYPE = os.getenv("PROXY_TYPE", "socks5").strip().lower()
 PROXY_MODE = os.getenv("PROXY_MODE", "rotate").strip().lower()
 PROXY_TEST_URL = os.getenv("PROXY_TEST_URL", "https://graph.facebook.com/me")
 
-HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", "0"))
+# Railway sets PORT for public networking; use it unless HEALTH_CHECK_PORT overrides.
+HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", os.getenv("PORT", "0")))
 HEALTH_CHECK_HOST = os.getenv("HEALTH_CHECK_HOST", "0.0.0.0")
 
 NETCHECK_ON_START = os.getenv("NETCHECK_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -47,8 +57,14 @@ STATE_DIR = os.getenv("STATE_DIR", "./data")
 ZIP_MAX_TOTAL = int(os.getenv("ZIP_MAX_TOTAL", str(256 * 1024 * 1024)))  # 256MB default
 ZIP_MAX_FILE = int(os.getenv("ZIP_MAX_FILE", str(16 * 1024 * 1024)))  # 16MB per entry
 
+# Proxy pe DEAD milne par direct (Railway IP) se confirm karna (1 = haan).
+# Accuracy ke liye better, lekin Railway IP target site ko dik sakta hai.
+VERIFY_CONFIRM_DEAD = os.getenv("VERIFY_CONFIRM_DEAD", "1").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
 # Bot version
-BOT_VERSION = "2.2.0"
+BOT_VERSION = "2.3.0"
 
 # Encryption key for cookie storage at rest
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")

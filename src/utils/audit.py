@@ -16,7 +16,7 @@ AUDIT_LOG_FILE = os.getenv("AUDIT_LOG_FILE", "audit.log")
 MAX_AUDIT_LOG_SIZE = int(os.getenv("MAX_AUDIT_LOG_SIZE", str(10 * 1024 * 1024)))  # 10MB
 
 
-def audit_log(uid: int, action: str, details: Optional[Dict[str, Any]] = None) -> None:
+async def audit_log(uid: int, action: str, details: Optional[Dict[str, Any]] = None) -> None:
     """Log an admin action for audit purposes.
 
     Args:

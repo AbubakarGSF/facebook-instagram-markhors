@@ -3,15 +3,12 @@
 Live check, post, and cookie rework for Instagram accounts.
 """
 
-import asyncio
 import logging
-import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
 from .base import BasePlatform
-from src.utils.ratelimit import rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -22,66 +19,89 @@ class InstagramPlatform(BasePlatform):
     # Instagram check endpoints
     CHECK_URL = "https://www.instagram.com/"
     MOBILE_CHECK_URL = "https://www.instagram.com/accounts/edit/"
+    API_URL = "https://i.instagram.com/api/v1/accounts/current_user/?edit=true"
+    GRAPH_URL = "https://graph.facebook.com/v21.0"
 
     async def live_check_impl(self, client: httpx.AsyncClient, cookies: Dict[str, str]) -> Dict[str, Any]:
         """Instagram cookie se check karo ki account working hai ya dead."""
 
+        if not cookies.get("sessionid"):
+            return {
+                "Status": "DEAD",
+                "Platform": "instagram",
+                "Reason": "missing cookie: sessionid",
+            }
+
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 320.0.0.0"
+            ),
             "Cookie": cookie_header,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
+            "X-IG-App-ID": "936619743392459",
+            "X-ASBD-ID": "129477",
+            "X-IG-WWW-Claim": "0",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
         }
 
         try:
-            r = await client.get(self.CHECK_URL, headers=headers)
+            # Private mobile API: returns the logged-in user or login_required.
+            r = await client.get(self.API_URL, headers=headers)
+            path = (r.url.path or "").lower()
 
-            if r.status_code == 200:
-                html = r.text
-
-                # Check if redirected to login (cookie dead)
-                if "login" in r.url.lower() or '"is_logged_in":false' in html:
-                    return {
-                        "Status": "DEAD",
-                        "Platform": "instagram",
-                        "Reason": "redirected to login or not logged in",
-                    }
-
-                # Try to extract username from page
-                uname_match = re.search(
-                    r'"username"\s*:\s*"([^"]+)"', html
-                )
-                username = uname_match.group(1) if uname_match else ""
-
-                # Try to extract user id
-                ig_id_match = re.search(r'"pk"\s*:\s*"?(\d+)"?', html)
-                ig_id = ig_id_match.group(1) if ig_id_match else ""
-
+            if "login" in path:
                 return {
-                    "Status": "LIVE",
+                    "Status": "DEAD",
                     "Platform": "instagram",
-                    "username": username,
-                    "ig_id": ig_id,
-                    "fb_id": "",
-                    "Reason": "",
+                    "Reason": "login redirect",
                 }
 
-            if r.status_code in (302, 301):
-                location = r.headers.get("location", "")
-                if "login" in location.lower() or "accounts/login" in location.lower():
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                except Exception:  # noqa: BLE001
+                    data = {}
+                user = data.get("user") if isinstance(data, dict) else None
+                if user:
+                    return {
+                        "Status": "LIVE",
+                        "Platform": "instagram",
+                        "username": str(user.get("username") or ""),
+                        "ig_id": str(user.get("pk") or user.get("pk_id") or ""),
+                        "fb_id": "",
+                        "followers": user.get("follower_count", ""),
+                        "Reason": "",
+                    }
+                msg = ""
+                if isinstance(data, dict):
+                    msg = str(data.get("message", ""))
+                if "login" in msg.lower() or not data:
                     return {
                         "Status": "DEAD",
                         "Platform": "instagram",
-                        "Reason": "login redirect",
+                        "Reason": f"login_required ({msg or 'empty response'})",
                     }
+                return {
+                    "Status": "UNKNOWN",
+                    "Platform": "instagram",
+                    "Reason": "HTTP 200 without user payload",
+                }
 
             if r.status_code in (401, 403):
                 return {
                     "Status": "DEAD",
                     "Platform": "instagram",
                     "Reason": "auth failed (401/403)",
+                }
+
+            if r.status_code == 429:
+                return {
+                    "Status": "UNKNOWN",
+                    "Platform": "instagram",
+                    "Reason": "rate limited (429)",
                 }
 
             return {
@@ -104,60 +124,61 @@ class InstagramPlatform(BasePlatform):
                 "Reason": str(e)[:80],
             }
 
-    async def post(self, client: httpx.AsyncClient, cookies: Dict[str, str], text: str, media: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[str]]:
-        """Instagram par post publish karo."""
+    async def post(
+        self,
+        client: httpx.AsyncClient,
+        cookies: Dict[str, str],
+        text: str,
+        media: Optional[str] = None,
+        access_token: Optional[str] = None,
+        target_id: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Publish via Graph API only (Instagram has no text-only post).
 
-        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        Requires an access token, the IG business account id and a publicly
+        reachable image URL (`media`). Anything else fails explicitly instead
+        of pretending a 200 meant a successful post.
+        """
+        if not access_token or not target_id:
+            return (
+                False,
+                None,
+                "UNSUPPORTED: IG post ke liye access_token + ig business id chahiye",
+            )
+        if not media or not str(media).lower().startswith(("http://", "https://")):
+            return (
+                False,
+                None,
+                "UNSUPPORTED: IG text-only post nahi hota; public image URL chahiye",
+            )
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Cookie": cookie_header,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": "https://www.instagram.com",
-            "Referer": "https://www.instagram.com/",
-        }
+        try:
+            r = await client.post(
+                f"{self.GRAPH_URL}/{target_id}/media",
+                data={
+                    "image_url": media,
+                    "caption": text,
+                    "access_token": access_token,
+                },
+            )
+            if r.status_code != 200:
+                return False, None, f"HTTP {r.status_code}: {r.text[:80]}"
+            creation_id = (r.json() or {}).get("id")
+            if not creation_id:
+                return False, None, "graph: creation id nahi mila"
 
-        payload = {
-            "caption": text,
-        }
-
-        max_retries = 5
-
-        for attempt in range(max_retries):
-            try:
-                r = await client.post(
-                    "https://www.instagram.com/api/v1/web/posts/create/",
-                    headers=headers,
-                    data=payload,
-                )
-
-                if r.status_code == 200:
-                    return True, None, None
-
-                if r.status_code == 429:
-                    # Rate limited - wait and retry
-                    retry_after = None
-                    retry_after_header = r.headers.get("retry-after") or r.headers.get("Retry-After")
-                    if retry_after_header:
-                        try:
-                            retry_after = int(retry_after_header)
-                        except ValueError:
-                            retry_after = None
-                    wait = rate_limiter.record_response("instagram", 429, retry_after)
-                    if wait:
-                        await asyncio.sleep(wait)
-                        continue
-                    return False, None, "RATE"
-
-                if r.status_code in (401, 403):
-                    return False, None, "DEAD"
-
-                return False, None, f"HTTP {r.status_code}"
-
-            except httpx.ConnectError as e:
-                return False, None, "NET"
-            except Exception as e:
-                logger.exception("ig post")
-                return False, None, str(e)[:80]
-
-        return False, None, "RATE_MAX_RETRIES"
+            r2 = await client.post(
+                f"{self.GRAPH_URL}/{target_id}/media_publish",
+                data={"creation_id": creation_id, "access_token": access_token},
+            )
+            if r2.status_code == 200:
+                post_id = (r2.json() or {}).get("id")
+                if post_id:
+                    return True, str(post_id), None
+                return False, None, "graph: publish id nahi mila"
+            return False, None, f"publish HTTP {r2.status_code}: {r2.text[:80]}"
+        except httpx.ConnectError:
+            return False, None, "NET"
+        except Exception as e:  # noqa: BLE001
+            logger.exception("ig post")
+            return False, None, str(e)[:80]
