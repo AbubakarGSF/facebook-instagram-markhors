@@ -371,13 +371,14 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fb = "ON" if _fb_platform else "OFF"
     ig = "ON" if _ig_platform else "OFF"
     await update.message.reply_text(
-        f"Social Markhors Bot\n"
+        f"Social Markhors Bot v{BOT_VERSION}\n"
         f"Credit: {CREDIT}\n"
         f"Web: {WEBSITE}\n"
         f"Admin: {uid in ADMIN_IDS}\n"
         f"Facebook: {fb}\n"
         f"Instagram: {ig}\n"
-        f"DB: {'ON' if _db else 'OFF'}"
+        f"DB: {'ON' if _db else 'OFF'}\n"
+        f"Proxies: {len(load_proxies())}"
     )
 
 
