@@ -61,16 +61,97 @@ def _cookie_line(ck: str) -> str:
     return line
 
 
-def build_cookie_file(data: Dict[str, str], cookies: List[str]) -> str:
+def _norm_meta(data: Dict[str, Any]) -> Dict[str, str]:
+    """Metadata keys ko standard field names me normalize karo."""
+    aliases = {
+        "username": "Username",
+        "fb_id": "ID",
+        "ig_id": "ID",
+        "country": "Country",
+        "followers": "Followers",
+        "friends": "Friends",
+        "posts": "Posts",
+        "verified": "Verified",
+        "status": "Status",
+        "via": "Via",
+        "reason": "Reason",
+        "name": "Username",
+    }
+    out: Dict[str, str] = {}
+    for k, v in (data or {}).items():
+        if v is None or v == "":
+            continue
+        key = aliases.get(str(k).lower(), str(k))
+        if key == "ID" and not v:
+            continue
+        out[key] = str(v)
+    return out
+
+
+def build_cookie_file(data: Dict[str, Any], cookies: List[str]) -> str:
     """Build a cookie file string from metadata and cookies."""
+    meta = _norm_meta(data)
     out = ["Valid Cookie  /  Every day!", WEBSITE, CREDIT, ""]
     for f in FIELDS:
-        v = data.get(f)
+        v = meta.pop(f, None)
         out.append("\u2013 " + f + ": " + (v if v not in (None, "") else "\u2013"))
+    for k in sorted(meta):
+        out.append("\u2013 " + k + ": " + meta[k])
     out.append("\u2013 Cookies: " + CREDIT)
     out.append("")
     out.extend(_cookie_line(c) for c in (cookies or []))
     return "\n".join(out).rstrip() + "\n"
+
+
+_META_RE = re.compile(r"^[\u2013\u2014\-]\s*([^:]{1,40}):\s*(.*)$")
+
+
+def parse_meta(raw: str, filename: str = "") -> Dict[str, str]:
+    """Input file header + filename se metadata nikalo (rework ke liye)."""
+    meta: Dict[str, str] = {}
+
+    # 1) Header lines: "– ID: 123", "– Name: x", etc.
+    for line in (raw or "").splitlines()[:40]:
+        if "\t" in line:  # cookie line shuru ho gayi
+            break
+        m = _META_RE.match(line.strip())
+        if not m:
+            continue
+        k, v = m.group(1).strip(), m.group(2).strip()
+        if not v or k.lower() == "cookies":
+            continue
+        key = "Username" if k.lower() in ("name", "username") else k
+        meta[key] = v
+
+    # 2) Filename brackets se missing values fill karo
+    name = filename or ""
+    patterns = [
+        (r"\[(\d+)\s+friends\]", "Friends"),
+        (r"\[(\d+)\s+followers\]", "Followers"),
+        (r"\[(\d+)\s+posts\]", "Posts"),
+        (r"\[(\d+)\s+likes\]", "Likes"),
+        (r"\[business\s+(true|false)\]", "Business"),
+        (r"\[marketplace\s+(true|false)\]", "Marketplace"),
+        (r"\[verified\s+(true|false)\]", "Verified"),
+        (r"\[([A-Z]{2})\]", "Country"),
+        (r"\[(\d{6,})\]", "ID"),
+    ]
+    for pat, key in patterns:
+        if key in meta and meta[key]:
+            continue
+        m = re.search(pat, name, re.I)
+        if m:
+            meta[key] = m.group(1)
+
+    # 3) Instagram username filename format: [... ] [username].txt
+    if "ID" not in meta and "Username" not in meta:
+        m = re.search(r"\]\s*\[([^\[\]]{1,40})\]\s*\.txt$", name, re.I)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate and not candidate.isdigit():
+                meta["Username"] = candidate.lstrip("@")
+
+    return meta
 
 
 # ============================ GLOBAL STATE ============================
@@ -797,7 +878,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if proxies are configured - without them all traffic goes direct
     if not PROXIES:
         await msg.edit_text(
-            "⚠️ No proxies configured! All X traffic will go direct.\n"
+            "⚠️ No proxies configured! All Facebook/Instagram traffic will go direct.\n"
             "Add proxies with /proxy add before uploading cookies."
         )
 
@@ -832,12 +913,20 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 for name in names[:MAX_FILES]:
                     raw = z.read(name).decode("utf-8", "ignore")
-                    result = await _process_one(name, raw, state)
+                    try:
+                        result = await _process_one(name, raw, state)
+                    except Exception as e:  # noqa: BLE001
+                        logger.exception("process failed: %s", name)
+                        result = (name, "", f"ERROR: {type(e).__name__}: {str(e)[:60]}")
                     results.append(result)
         else:
             with open(path, encoding="utf-8", errors="ignore") as f:
                 raw = f.read()
-            result = await _process_one(doc.file_name, raw, state)
+            try:
+                result = await _process_one(doc.file_name, raw, state)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("process failed: %s", doc.file_name)
+                result = (doc.file_name, "", f"ERROR: {type(e).__name__}: {str(e)[:60]}")
             results.append(result)
 
         # If campaign mode, run campaign loop
@@ -958,7 +1047,8 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
 
     platform_obj = get_platform(platform)
     bp = BasePlatform()
-    meta, cookies = bp.parse_cookie_file(raw)
+    _, cookies = bp.parse_cookie_file(raw)
+    meta = parse_meta(raw, name)
 
     if not cookies:
         return (name, "", "no cookies")
@@ -976,20 +1066,25 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
         reason = "live check off"
 
     meta.update({"Status": status, "Reason": reason})
-    output = bp.build_cookie_file(meta, cookies)
+    output = build_cookie_file(meta, cookies)
 
     # Save LIVE accounts to DB
     if status == "LIVE" and _db:
         table = "fb_accounts" if platform == "facebook" else "ig_accounts"
         encrypted_cookies = encrypt_cookies(cookies)
+        norm = _norm_meta(meta)
+        try:
+            followers = int(str(norm.get("Followers", "0")).split()[0])
+        except (ValueError, IndexError):
+            followers = 0
         row = {
-            "username": meta.get("username", ""),
-            "fb_id": meta.get("fb_id", "") if platform == "facebook" else "",
-            "ig_id": meta.get("ig_id", "") if platform == "instagram" else "",
+            "username": norm.get("Username", ""),
+            "fb_id": norm.get("ID", "") if platform == "facebook" else "",
+            "ig_id": norm.get("ID", "") if platform == "instagram" else "",
             "cookies": encrypted_cookies,
-            "country": meta.get("country", ""),
-            "followers": int(meta.get("Followers", 0) or 0),
-            "verified": str(meta.get("Verified", "false")).lower() == "true",
+            "country": norm.get("Country", ""),
+            "followers": followers,
+            "verified": str(norm.get("Verified", "false")).lower() == "true",
             "status": "live",
             "source": "bot",
         }

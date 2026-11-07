@@ -65,34 +65,50 @@ class BasePlatform:
 
         for line in (text or "").splitlines():
             line = line.rstrip("\r")
-            if not line.strip() or line.strip().startswith("#"):
+            httponly = line.startswith("#HttpOnly_")
+            if httponly:
+                line = line[len("#HttpOnly_"):]
+            elif not line.strip() or line.strip().startswith("#"):
                 continue
 
             # Netscape tab-separated: domain\tflag\tpath\tsecure\texpire\tname\tvalue
             if "\t" in line and len(line.split("\t")) >= 7:
                 parts = line.split("\t")
+                domain = parts[0].strip() or ".domain"
+                flag = parts[1].strip() or "TRUE"
+                cpath = parts[2].strip() or "/"
+                secure = parts[3].strip() or "TRUE"
+                expiry = parts[4].strip()
+                if not expiry.isdigit():
+                    expiry = str(exp)
                 name = parts[5].strip()
                 val = parts[6].strip()
                 if name and val and name not in seen:
                     seen.add(name)
-                    cookies.append(
-                        f".domain\tTRUE\t/\tTRUE\t{exp}\t{name}\t{val}"
-                    )
+                    data[name] = val
+                    cookie = f"{domain}\t{flag}\t{cpath}\t{secure}\t{expiry}\t{name}\t{val}"
+                    if httponly:
+                        cookie = "#HttpOnly_" + cookie
+                    cookies.append(cookie)
                 continue
 
-            # key=value or key: value
-            for sep in ("=", ":"):
-                if sep in line:
-                    idx = line.index(sep)
-                    k = line[:idx].strip()
-                    v = line[idx + len(sep):].strip().strip('"').strip("'")
-                    if k and v and k not in seen:
-                        seen.add(k)
-                        data[k] = v
-                        cookies.append(
-                            f".domain\tTRUE\t/\tTRUE\t{exp}\t{k}\t{v}"
-                        )
-                    break
+            # key=value or key: value (strict — header lines aur URLs skip)
+            m = re.match(r"^([A-Za-z0-9_.\-]{1,60})\s*(=|:)\s*(.+)$", line)
+            if not m:
+                continue
+            k = m.group(1).strip()
+            sep = m.group(2)
+            v = m.group(3).strip().strip('"').strip("'")
+            if not k or not v or k in seen:
+                continue
+            if sep == ":" and (v.startswith("//") or " " in v):
+                continue
+            seen.add(k)
+            data[k] = v
+            cookie = f".domain\tTRUE\t/\tTRUE\t{exp}\t{k}\t{v}"
+            if httponly:
+                cookie = "#HttpOnly_" + cookie
+            cookies.append(cookie)
 
         return data, cookies
 
