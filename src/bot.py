@@ -306,14 +306,67 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
         await update.message.reply_text("Sirf admin.")
         return
-    if not check_user_rate_limit(update.effective_user.id):
+    if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
-    await update.message.reply_text(proxy_status_text())
-    await audit_log(update.effective_user.id, "proxy_status", {})
+    args = context.args
+    if not args or args[0] == "status":
+        await update.message.reply_text(proxy_status_text())
+        await audit_log(uid, "proxy_status", {})
+        return
+    if args[0] == "detect":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /proxy detect <host:port[:user:pass]>")
+            return
+        entry = args[1]
+        await update.message.reply_text(f"Detecting proxy type for {entry}...")
+        await _proxy_detect(update, entry)
+        await audit_log(uid, "proxy_detect", {"entry": entry})
+        return
+    await update.message.reply_text("Usage: /proxy [status|detect host:port]")
+    await audit_log(uid, "proxy_status", {})
+
+
+    await update.message.reply_text("Usage: /proxy [status|detect host:port]")
+    await audit_log(uid, "proxy_status", {})
+
+
+async def _proxy_detect(u, entry: str):
+    """Test both SOCKS5 and HTTP protocols against host:port and tell which works."""
+    async def probe(proxy_url: str, scheme: str):
+        try:
+            cl = httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(10.0))
+            r = await cl.get("https://api.x.com/1.1/account/verify_credentials.json")
+            if r.status_code == 200:
+                return True
+            return False
+        except Exception:
+            return False
+        finally:
+            await cl.aclose()
+
+    socks_result = await probe(f"socks5://{entry}", "socks5")
+    http_result = await probe(f"http://{entry}", "http")
+
+    if socks_result and http_result:
+        verdict = "Both SOCKS5 and HTTP work"
+    elif socks_result:
+        verdict = "SOCKS5 only"
+    elif http_result:
+        verdict = "HTTP only"
+    else:
+        verdict = "Neither works"
+
+    await u.message.reply_text(
+        f"Proxy detect for {entry}:\n"
+        f"SOCKS5: {'✓' if socks_result else '✗'}\n"
+        f"HTTP:   {'✓' if http_result else '✗'}\n"
+        f"Result: {verdict}"
+    )
 
 
 async def netcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
