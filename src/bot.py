@@ -28,8 +28,10 @@ from src.platforms.base import BasePlatform
 from src.platforms.facebook import FacebookPlatform
 from src.platforms.instagram import InstagramPlatform
 from src.utils.crypto import decrypt_cookies, encrypt_cookies
+from src.utils.crypto import decrypt_cookies, encrypt_cookies
 from src.utils.proxy import load_proxies, proxy_status_text, norm_proxy, mask_sensitive
 from src.utils.ratelimit import rate_limiter
+from src.utils.audit import audit_log
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +313,7 @@ async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
     await update.message.reply_text(proxy_status_text())
+    await audit_log(update.effective_user.id, "proxy_status", {})
 
 
 async def netcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -324,6 +327,7 @@ async def netcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Netcheck: Facebook + Instagram + Supabase reachability test\n"
         "Coming soon in next build."
     )
+    await audit_log(update.effective_user.id, "netcheck", {})
 
 
 async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -342,6 +346,7 @@ async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  Generic:     [free] [email].txt, free data @email .txt\n\n"
         "Output: branded zip with standard format (platform metadata included)."
     )
+    await audit_log(uid, "rework_start", {})
 
 
 async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -403,10 +408,12 @@ async def db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"DB stats:\nfb_accounts: {fb_count}\nig_accounts: {ig_count}"
             )
+            await audit_log(uid, "db_stats", {})
         elif sub == "export":
             platform = args[1].lower() if len(args) > 1 else "fb"
             table = "fb_accounts" if platform == "fb" else "ig_accounts"
             await update.message.reply_text(f"Export from {table} - coming in next build")
+            await audit_log(uid, "db_export", {"table": table})
         else:
             await update.message.reply_text("/db stats | /db export fb | /db export ig")
 
@@ -461,6 +468,7 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Bana: {cfg['name']}\n"
             f"Ab /camp platform facebook|instagram karo."
         )
+        await audit_log(uid, "campaign_new", {"name": cfg["name"]})
         return
 
     if sub == "platform":
@@ -471,6 +479,7 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cfg["platform"] = "facebook" if p in ("facebook", "fb") else "instagram"
         save_camp(uid)
         await update.message.reply_text(f"Platform = {cfg['platform']}")
+        await audit_log(uid, "campaign_platform", {"platform": cfg["platform"]})
         return
 
     if sub == "text":
@@ -571,11 +580,13 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Ab cookie zip bhejo (campaign ke liye)."
         )
+        await audit_log(uid, "campaign_start", {"name": cfg["name"], "platform": cfg["platform"]})
         return
 
     if sub == "reset":
         CAMPS.pop(uid, None)
         await update.message.reply_text("Reset.")
+        await audit_log(uid, "campaign_reset", {"name": cfg.get("name", "")})
         return
 
     await update.message.reply_text("Subcommand samajh nahi aayi. /camp dekho.")
@@ -592,6 +603,7 @@ async def stopcamp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in CAMPRUN:
         CAMPRUN[uid]["stop"] = True
         await update.message.reply_text("Stop - current account ke baad rukega.")
+        await audit_log(uid, "campaign_stop", {})
     else:
         await update.message.reply_text("Koi campaign nahi.")
 
@@ -865,6 +877,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_state.pop(uid, None)
     await update.message.reply_text("Cancel / reset.")
+    await audit_log(uid, "cancel", {})
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
