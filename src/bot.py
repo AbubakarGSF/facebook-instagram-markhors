@@ -36,6 +36,43 @@ logger = logging.getLogger(__name__)
 
 # ============================ GLOBAL STATE ============================
 
+# Cookie file field definitions (netscape format)
+FIELDS = ["Status", "Username", "ID", "Followers", "Friends", "Posts", "Likes", "Media",
+          "Verified", "Verified type", "Suspended", "Protected", "Country", "Year", "Created",
+          "Email", "Phone", "2FA", "Card added", "API", "Developer API"]
+
+# Cookie field names that should be marked HttpOnly
+HTTPONLY_NAMES = {"auth_token", "ct0", "kdt", "twid", "guest_id",
+                  "guest_id_marketing", "guest_id_ads"}
+
+
+def _cookie_line(ck: str) -> str:
+    """Build a Netscape-format cookie line."""
+    line = ck.rstrip("\r")
+    if line.startswith("#HttpOnly_"):
+        return line
+    try:
+        if line.split("\t")[5] in HTTPONLY_NAMES:
+            return "#HttpOnly_" + line
+    except Exception:
+        pass
+    return line
+
+
+def build_cookie_file(data: Dict[str, str], cookies: List[str]) -> str:
+    """Build a cookie file string from metadata and cookies."""
+    out = ["Valid Cookie  /  Every day!", WEBSITE, CREDIT, ""]
+    for f in FIELDS:
+        v = data.get(f)
+        out.append("\u2013 " + f + ": " + (v if v not in (None, "") else "\u2013"))
+    out.append("\u2013 Cookies: " + CREDIT)
+    out.append("")
+    out.extend(_cookie_line(c) for c in (cookies or []))
+    return "\n".join(out).rstrip() + "\n"
+
+
+# ============================ GLOBAL STATE ============================
+
 _db: Optional[SupabaseDB] = None
 _fb_platform: Optional[FacebookPlatform] = None
 _ig_platform: Optional[InstagramPlatform] = None
