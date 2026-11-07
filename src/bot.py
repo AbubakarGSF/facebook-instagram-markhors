@@ -7,6 +7,7 @@ Admin commands: /start, /help, /status, /diag, /proxy, /netcheck, /rework,
 import asyncio
 import csv
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import tempfile
 import time
 import zipfile as _zipfile
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -34,9 +36,13 @@ from config.settings import (
     FACEBOOK_URL,
     MAX_FILES,
     POST_BRANDING,
+    POST_MAX,
+    POST_MIN,
+    RETRIES,
     STATE_DIR,
     SUPABASE_URL,
     TELEGRAM_URL,
+    TIMEOUT,
     TWITTER_URL,
     VERIFY_CONFIRM_DEAD,
     WEBSITE,
@@ -56,6 +62,7 @@ from src.utils.proxy import (
     mask_proxy,
     mask_sensitive,
     norm_proxy,
+    pick_proxy,
     proxy_status_text,
     set_proxy_enabled,
     test_proxies,
@@ -174,22 +181,47 @@ def build_cookie_file(data: Dict[str, Any], cookies: List[str]) -> str:
 
 _META_RE = re.compile(r"^[\u2013\u2014\-]\s*([^:]{1,40}):\s*(.*)$")
 
+# Plain header keys jo dash ke bina bhi aati hain ("ID: 123", "Username: bob").
+# Whitelist hi rakhi hai taake cookie lines (`c_user: ...`) metadata na banein.
+_PLAIN_META_KEYS = {
+    "id", "username", "name", "country", "followers", "friends", "posts",
+    "likes", "verified", "business", "marketplace", "year", "created",
+    "suspended", "protected", "email", "phone", "status", "platform",
+}
+
+# Lowercase header key -> output field name (campaign filters canonical keys
+# par depend karte hain, is liye "country: pk" bhi "Country" ban jaye).
+_META_CANON = {
+    "id": "ID", "username": "Username", "name": "Username",
+    "country": "Country", "followers": "Followers", "friends": "Friends",
+    "posts": "Posts", "likes": "Likes", "verified": "Verified",
+    "business": "Business", "marketplace": "Marketplace", "year": "Year",
+    "created": "Created", "suspended": "Suspended", "protected": "Protected",
+    "email": "Email", "phone": "Phone", "status": "Status",
+    "platform": "Platform",
+}
+
 
 def parse_meta(raw: str, filename: str = "") -> Dict[str, str]:
     """Input file header + filename se metadata nikalo (rework ke liye)."""
     meta: Dict[str, str] = {}
 
-    # 1) Header lines: "– ID: 123", "– Name: x", etc.
+    # 1) Header lines: "– ID: 123", "ID: 123", "– Name: x", etc.
     for line in (raw or "").splitlines()[:40]:
         if "\t" in line:  # cookie line shuru ho gayi
             break
-        m = _META_RE.match(line.strip())
-        if not m:
-            continue
-        k, v = m.group(1).strip(), m.group(2).strip()
+        stripped = line.strip()
+        m = _META_RE.match(stripped)
+        if m:
+            k, v = m.group(1).strip(), m.group(2).strip()
+        else:
+            m = re.match(r"^([A-Za-z][A-Za-z0-9 _]{0,39}):\s*(.*)$", stripped)
+            if not m or m.group(1).strip().lower() not in _PLAIN_META_KEYS:
+                continue
+            k, v = m.group(1).strip(), m.group(2).strip()
         if not v or k.lower() == "cookies":
             continue
-        key = "Username" if k.lower() in ("name", "username") else k
+        key = _META_CANON.get(k.lower(), k)
         meta[key] = v
 
     # 2) Filename brackets se missing values fill karo
@@ -274,13 +306,49 @@ USER_STATE_TTL_MIN = int(os.getenv("USER_STATE_TTL_MIN", "30"))
 USER_CMD_COOLDOWN = float(os.getenv("USER_CMD_COOLDOWN", "2.0"))
 
 
+def _state_activity(st: dict) -> float:
+    """State ka sab se recent activity timestamp (0 = unknown/old)."""
+    return max(
+        float(st.get("at") or 0),
+        float(st.get("last_cmd") or 0),
+        float(st.get("last_content") or 0),
+    )
+
+
+def _set_state(uid: int, **updates) -> dict:
+    """user_state ko replace na karo — last_cmd/last_content preserve rahen.
+
+    Pehle `/rework` aur `/verify` poora dict replace kar dete the, jis se
+    command cooldown bypass ho jata tha aur content rate-limit key bhi ud jati thi.
+    """
+    st = user_state.get(uid) or {}
+    st.update(updates)
+    st.setdefault("at", time.time())
+    user_state[uid] = st
+    return st
+
+
 def cleanup_user_state():
     """Remove expired entries from user_state and CAMPS."""
     now = time.time()
     ttl = USER_STATE_TTL_MIN * 60
-    expired = [uid for uid, st in user_state.items() if now - st.get("at", now) > ttl]
+    # Rate-only state me `at` nahi hota; pehle sirf `at` dekhne se aisi entries
+    # kabhi expire nahi hoti thin (unbounded memory growth).
+    expired = [
+        uid for uid, st in user_state.items()
+        if now - _state_activity(st) > ttl
+    ]
     for uid in expired:
         user_state.pop(uid, None)
+
+    # Hard cap: TTL ke andar bhi hazaaron users state bana sakte hain.
+    max_entries = int(os.getenv("MAX_STATE_ENTRIES", "5000"))
+    if len(user_state) > max_entries:
+        oldest = sorted(
+            user_state.items(), key=lambda kv: _state_activity(kv[1])
+        )[: len(user_state) - max_entries]
+        for uid, _ in oldest:
+            user_state.pop(uid, None)
 
     # Also clean up old campaign configs (not running campaigns). stage_at=0
     # wale naye campaign ko turant expire nahi karna.
@@ -302,10 +370,18 @@ def init_db(url: str, key: str) -> Optional[SupabaseDB]:
     return None
 
 
-def init_platforms(concurrency: int = 8, timeout: float = 25.0):
+def init_platforms(
+    concurrency: int = CONCURRENCY,
+    timeout: float = TIMEOUT,
+    retries: int = RETRIES,
+):
     global _fb_platform, _ig_platform
-    _fb_platform = FacebookPlatform(concurrency=concurrency, timeout=timeout)
-    _ig_platform = InstagramPlatform(concurrency=concurrency, timeout=timeout)
+    _fb_platform = FacebookPlatform(
+        concurrency=concurrency, timeout=timeout, retries=retries
+    )
+    _ig_platform = InstagramPlatform(
+        concurrency=concurrency, timeout=timeout, retries=retries
+    )
 
 
 def get_platform(platform_name: str) -> Optional[BasePlatform]:
@@ -323,11 +399,51 @@ def _account_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "username": str(row.get("username") or row.get("fb_id") or row.get("ig_id") or ""),
         "cookies": decrypt_cookies(cookies) if cookies else {},
         "country": row.get("country") or "",
+        "year": row.get("year") or "",
         "followers": row.get("followers") or 0,
         "verified": row.get("verified"),
         "access_token": row.get("access_token") or "",
+        "media_url": row.get("media_url") or "",
         "target_id": row.get("fb_id") or row.get("ig_id") or "",
     }
+
+
+def _meta_first(meta: Dict[str, Any], *keys: str) -> str:
+    """Case/underscore-insensitive metadata lookup ("Access Token" bhi mile)."""
+    want = {k.strip().lower().replace("_", " ") for k in keys}
+    for k, v in (meta or {}).items():
+        if v in (None, ""):
+            continue
+        if str(k).strip().lower().replace("_", " ") in want:
+            return str(v).strip()
+    return ""
+
+
+def _filter_account(
+    acc: Dict[str, Any], check: Dict[str, Any], filt: Dict[str, Any]
+) -> Tuple[bool, str]:
+    """Campaign filter. Missing country/year strict mode me skip hota hai.
+
+    Pehle `and country` ki wajah se unknown-country accounts filter ke bawajood
+    campaign me chale jate the.
+    """
+    country = str(acc.get("country") or check.get("country") or "")
+    year = str(acc.get("year") or "")
+    followers = _to_int(acc.get("followers")) or _to_int(
+        check.get("followers") or check.get("Followers")
+    )
+
+    if filt.get("countries"):
+        allowed = {str(c).upper() for c in filt["countries"]}
+        if not country or country.upper() not in allowed:
+            return False, f"FILTER country={country or 'missing'}"
+    if filt.get("years"):
+        allowed_years = {str(y) for y in filt["years"]}
+        if not year or year not in allowed_years:
+            return False, f"FILTER year={year or 'missing'}"
+    if filt.get("min_followers", 0) > followers:
+        return False, f"FILTER followers={followers}"
+    return True, ""
 
 
 def new_camp() -> dict:
@@ -337,7 +453,7 @@ def new_camp() -> dict:
         "tag": DEFAULT_TAG,
         "filter": {"countries": [], "years": [], "min_followers": 0},
         "limit": 0,
-        "delay": [45, 110],
+        "delay": [POST_MIN, POST_MAX],
         "max_parts": 3,
         "cleanup_partial": True,
         "dry_run": False,
@@ -410,13 +526,12 @@ def safe_zip_entry_name(name: str) -> str:
 
 
 def _pick_proxy() -> Optional[str]:
-    """Currently active proxy list se ek valid proxy choose karo."""
+    """Currently active proxy list se PROXY_MODE ke hisaab se proxy choose karo."""
     try:
-        proxies = get_active_proxies()
+        return pick_proxy()
     except Exception:  # noqa: BLE001
-        logger.exception("get_active_proxies failed")
-        proxies = []
-    return random.choice(proxies) if proxies else None
+        logger.exception("pick_proxy failed")
+        return None
 
 
 def _is_admin(uid: int) -> bool:
@@ -605,6 +720,25 @@ class ProgressReporter:
         except Exception as e:  # noqa: BLE001
             # "Message is not modified" / flood wait — progress best-effort hai
             logger.debug("progress edit skipped: %s", e)
+
+
+def _valid_media_url(url: str) -> bool:
+    """Public image URL validation: Graph API localhost/private host fetch nahi kar sakta."""
+    try:
+        u = urlparse((url or "").strip())
+        if u.scheme not in ("http", "https") or not u.hostname:
+            return False
+        host = u.hostname.lower()
+    except Exception:  # noqa: BLE001
+        return False
+    if host == "localhost" or host.endswith(".local"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # Domain name (dot hona chahiye), single-label intranet host reject.
+        return "." in host
+    return ip.is_global
 
 
 def safe_text(text: str, max_len: int = 4096) -> str:
@@ -899,7 +1033,7 @@ async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
     prev_live = user_state.get(uid, {}).get("live", False)
-    user_state[uid] = {"mode": "rework", "platform": None, "live": prev_live, "at": time.time()}
+    _set_state(uid, mode="rework", platform=None, live=prev_live, at=time.time())
     await update.message.reply_text(
         "Mode = rework. Ab cookie .txt ya .zip bhejo.\n"
         "Supported formats:\n"
@@ -919,7 +1053,7 @@ async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_user_rate_limit(uid):
         await update.message.reply_text("Rate limit hit. Please wait before sending another command.")
         return
-    user_state[uid] = {"mode": "verify", "live": True, "at": time.time()}
+    _set_state(uid, mode="verify", live=True, at=time.time())
     await update.message.reply_text(
         "Mode = verify. Ab cookie zip bhejo.\n"
         "Check: pehle proxy (agar configured hai), phir direct Railway IP.\n"
@@ -945,14 +1079,10 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     val = args[0].lower()
     if val in ("on", "1", "yes"):
-        user_state[uid] = user_state.get(uid, {})
-        user_state[uid]["live"] = True
-        user_state[uid]["at"] = time.time()
+        _set_state(uid, live=True, at=time.time())
         await update.message.reply_text("Live = ON")
     elif val in ("off", "0", "no"):
-        user_state[uid] = user_state.get(uid, {})
-        user_state[uid]["live"] = False
-        user_state[uid]["at"] = time.time()
+        _set_state(uid, live=False, at=time.time())
         await update.message.reply_text("Live = OFF")
     else:
         await update.message.reply_text("Usage: /live on|off")
@@ -1014,27 +1144,31 @@ async def _db_reverify(update: Update, context: ContextTypes.DEFAULT_TYPE, platf
     counts = {"working": 0, "dead": 0, "unknown": 0, "errors": 0}
     last_note = ""
     done = 0
-
-    for row in rows:
-        uname = str(row.get("username") or row.get("fb_id") or row.get("ig_id") or "?")
-        try:
-            ck = decrypt_cookies(row.get("cookies") or {})
-            check = await _verify_cookie(platform_obj, ck, proxy=_pick_proxy())
-            status = check.get("Status", "UNKNOWN")
-            counts[_status_folder(status)] += 1
-            last_note = f"{status} | {uname}"
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as dcl:
+    # Ek hi DB client poore reverify ke liye (per-account client waste tha).
+    db_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+    try:
+        for row in rows:
+            uname = str(row.get("username") or row.get("fb_id") or row.get("ig_id") or "?")
+            try:
+                ck = decrypt_cookies(row.get("cookies") or {})
+                check = await _verify_cookie(platform_obj, ck, proxy=_pick_proxy())
+                status = check.get("Status", "UNKNOWN")
+                counts[_status_folder(status)] += 1
+                last_note = f"{status} | {uname}"
                 await _db.patch_status(
-                    dcl, table, uname, status.lower(), ok=(status == "LIVE")
+                    db_client, table, uname, status.lower(), ok=(status == "LIVE")
                 )
-        except Exception as e:  # noqa: BLE001
-            logger.exception("db reverify %s", uname)
-            counts["errors"] += 1
-            last_note = f"ERROR {type(e).__name__} | {uname}"
-        done += 1
-        await reporter.update(done, counts, last=last_note)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("db reverify %s", uname)
+                counts["errors"] += 1
+                last_note = f"ERROR {type(e).__name__} | {uname}"
+            done += 1
+            await reporter.update(done, counts, last=last_note)
 
-    await reporter.update(done, counts, last=last_note, force=True)
+        await reporter.update(done, counts, last=last_note, force=True)
+    finally:
+        await db_client.aclose()
+
     await msg.edit_text(
         f"DB reverify done | {table}\n"
         f"working: {counts['working']} | dead: {counts['dead']} | "
@@ -1223,8 +1357,11 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Media URL clear.")
             return
         url = args[1] if len(args) > 1 else ""
-        if not url.lower().startswith(("http://", "https://")):
-            await update.message.reply_text("Usage: /camp mediaurl https://public/image.jpg")
+        if not _valid_media_url(url):
+            await update.message.reply_text(
+                "Usage: /camp mediaurl https://public-host/image.jpg "
+                "(localhost/private IP nahi chalega)"
+            )
             return
         cfg["media_url"] = url
         save_camp(uid)
@@ -1429,6 +1566,11 @@ async def _start_campaign_from_db(update: Update, context: ContextTypes.DEFAULT_
         return
 
     msg = await update.message.reply_text(f"DB campaign shuru: {len(accounts)} live accounts")
+    await audit_log(
+        uid,
+        "campaign_start_db",
+        {"table": table, "accounts": len(accounts), "limit": limit},
+    )
     CAMPRUN[uid] = {"stop": False}
     try:
         await _campaign_loop(uid, cfg, accounts, CAMPRUN[uid], update=update, progress_msg=msg)
@@ -1531,22 +1673,10 @@ async def _campaign_loop(
         followers = _to_int(acc.get("followers")) or _to_int(
             check.get("followers") or check.get("Followers")
         )
-        year = str(acc.get("year") or "")
-        if filt.get("countries") and country and country.upper() not in [
-            c.upper() for c in filt["countries"]
-        ]:
+        passes, filter_note = _filter_account(acc, check, filt)
+        if not passes:
             skipped_count += 1
-            last_note = f"FILTER country={country} | {uname}"
-            return
-        if filt.get("years") and year and year not in [
-            str(y) for y in filt["years"]
-        ]:
-            skipped_count += 1
-            last_note = f"FILTER year={year} | {uname}"
-            return
-        if filt.get("min_followers", 0) > followers:
-            skipped_count += 1
-            last_note = f"FILTER followers={followers} | {uname}"
+            last_note = f"{filter_note} | {uname}"
             return
 
         if cfg.get("dry_run"):
@@ -1922,6 +2052,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # If campaign mode, run campaign loop
         if mode == "campaign":
             cfg = CAMPS.get(uid)
+            # Campaign beech me /camp reset ho sakta hai; None par cfg["platform"]
+            # crash karta tha.
+            if not cfg:
+                await msg.edit_text(
+                    "Campaign reset ho chuka hai — cookies process ho gayi lekin "
+                    "posting nahi hui. /camp new se dobara banao."
+                )
+                return
             accounts = []
             skipped_platform = 0
             for name, _out, _status, cookies, meta in results:
@@ -1948,8 +2086,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "year": meta.get("Year", ""),
                     "followers": _to_int(meta.get("Followers")),
                     "verified": str(meta.get("Verified", "")).lower() == "true",
-                    "access_token": str(
-                        meta.get("Access token") or meta.get("Token") or ""
+                    "access_token": _meta_first(
+                        meta, "access token", "access_token", "token"
                     ),
                     "target_id": str(meta.get("ID", "")),
                 })
@@ -2043,20 +2181,15 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
             "Reason": f"platform mismatch: file {hint} cookies, checker {platform_obj.NAME}",
         }
 
-    routes = []
+    # Lazy factories: agar proxy route LIVE mil jaye to direct client banega hi
+    # nahi. Pehle dono clients eagerly bante the aur sirf ek close hota tha
+    # (connection leak).
+    routes: List[Tuple[str, Any]] = []
     if proxy:
-        try:
-            routes.append(("proxy", platform_obj.http_client(proxy=proxy)))
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "proxy client create failed (%s): %s",
-                mask_proxy(proxy),
-                mask_sensitive(str(e)),
-            )
-    try:
-        routes.append(("direct", platform_obj.http_client()))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("direct client create failed: %s", e)
+        routes.append(
+            ("proxy", lambda p=proxy: platform_obj.http_client(proxy=p))
+        )
+    routes.append(("direct", lambda: platform_obj.http_client()))
 
     if not routes:
         return {
@@ -2070,8 +2203,10 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
     dead_result = None
     last_error = None
 
-    for label, cl in routes:
+    for label, factory in routes:
+        cl = None
         try:
+            cl = factory()
             check = await platform_obj.live_check(cl, cookies)
         except Exception as e:
             logger.warning(
@@ -2083,7 +2218,8 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
                 "Reason": f"{type(e).__name__}: {mask_sensitive(str(e))[:60]}",
             }
         finally:
-            await cl.aclose()
+            if cl is not None:
+                await cl.aclose()
 
         check["via"] = label
         results.append(check)
@@ -2321,6 +2457,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Empty text not allowed.")
         return
 
+    max_variants = int(os.getenv("MAX_TEXT_VARIANTS", "20"))
+    if len(cfg["texts"]) >= max_variants:
+        await update.message.reply_text(
+            f"Variant limit {max_variants} hai. /camp reset karke naya campaign banao."
+        )
+        return
+
     cfg["texts"].append(text)
     save_camp(uid)
     await update.message.reply_text(
@@ -2343,6 +2486,9 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = update.message
+    if not check_content_rate_limit(uid):
+        await msg.reply_text("Thoda ruk kar dobara bhejo (flood protection).")
+        return
     if msg.photo:
         entry = {"type": "photo", "file_id": msg.photo[-1].file_id}
     elif msg.video:

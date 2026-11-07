@@ -83,3 +83,30 @@ def test_mask_sensitive_hides_bare_credentials():
     masked = mask_sensitive("connect user:supersecret@1.2.3.4:1080 failed")
     assert "supersecret" not in masked
     assert "***:***@" in masked
+
+
+def test_pick_proxy_honors_proxy_mode(monkeypatch):
+    import src.utils.proxy as px
+
+    monkeypatch.setattr(px, "PROXIES", ["http://a:1", "http://b:2"])
+    monkeypatch.setattr(px, "_PROXIES_LOADED", True)
+    monkeypatch.setattr(px, "PROXY_DISABLED", False)
+
+    monkeypatch.setenv("PROXY_MODE", "first")
+    assert px.pick_proxy() == "http://a:1"
+
+    monkeypatch.setenv("PROXY_MODE", "rotate")
+    assert px.pick_proxy() in px.PROXIES
+
+
+def test_load_proxies_keeps_skipped_list_bounded(monkeypatch, tmp_path):
+    import src.utils.proxy as px
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PROXY_FILE", raising=False)
+    monkeypatch.setenv("PROXIES", "socks4://1.1.1.1:1 socks4://2.2.2.2:2")
+    px.load_proxies()
+    first = len(px.PROXY_SKIPPED)
+    px.load_proxies()
+    second = len(px.PROXY_SKIPPED)
+    assert first == second == 2

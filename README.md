@@ -37,10 +37,13 @@ PROXY_TYPE=socks5
 ```
 
 Optional: `HEALTH_CHECK_PORT` / Railway `PORT`, `CONCURRENCY`, `TIMEOUT`,
-`ACC_TIMEOUT`, `MAX_FILES`, `FILE_TIMEOUT`, `CONTENT_COOLDOWN`,
-`VERIFY_SLOW_RETRY_SEC`, `VERIFY_CONFIRM_DEAD`, `PROGRESS_UPDATE_SEC`,
-`NETCHECK_ON_START`, `STATE_DIR`, `ZIP_MAX_*`, `IG_MEDIA_POLLS`,
-`IG_MEDIA_POLL_SEC`.
+`ACC_TIMEOUT`, `RETRIES`, `POST_MIN`, `POST_MAX`, `MAX_FILES`, `FILE_TIMEOUT`,
+`CONTENT_COOLDOWN`, `VERIFY_SLOW_RETRY_SEC`, `VERIFY_CONFIRM_DEAD`,
+`PROGRESS_UPDATE_SEC`, `NETCHECK_ON_START`, `STATE_DIR`, `ZIP_MAX_*`,
+`IG_MEDIA_POLLS`, `IG_MEDIA_POLL_SEC`, `MAX_STATE_ENTRIES`, `MAX_TEXT_VARIANTS`.
+
+`PROXY_MODE`: `rotate` (default, random per pick) ya `first` / `single` /
+`sticky` (pehla configured proxy har baar).
 
 `ENCRYPTION_KEY` generate karne ke liye:
 
@@ -107,10 +110,22 @@ check hoti hain.
 
 - Proxy se `DEAD` aaye aur direct route confirm na kare to result `UNKNOWN`.
 - FB/IG `403` (IP/checkpoint block) → `UNKNOWN`, `401` → `DEAD`.
+- FB login/JS page par sirf weak marker (`notifications` / `"userid"`) mile to
+  `LIVE` claim nahi hota — strong session marker ya do weak markers chahiye.
 - IG empty `200` → `UNKNOWN`; sirf explicit `login_required` / challenge → `DEAD`.
 - Missing session key wali file network par nahi jati — seedha `UNKNOWN`.
 - File ka processing time `FILE_TIMEOUT` se capped hai; hang hone par file
   `errors/` me jati hai aur baqi processing chalti rehti hai.
+
+### Campaign filters
+
+`/camp filter country PK,US` aur `/camp filter year 2015,2016` **strict** hain:
+account me country/year missing ho to wo skip hota hai (filter bypass nahi
+hota). `min_followers` bhi usi tarah apply hota hai.
+
+`/camp mediaurl` sirf public `http(s)` host accept karta hai — localhost,
+private IP aur single-label intranet hosts reject hote hain (Graph API unhe
+fetch nahi kar sakta).
 
 DB row ke liye owner id session cookie se bhi li jati hai (`c_user` FB,
 `ds_user_id` IG) — HTML metadata na mile to bhi row skip nahi hoti.

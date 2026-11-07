@@ -113,6 +113,14 @@ class SupabaseDB:
             return ok, (None if ok == len(cleaned) else last_error)
         return 0, last_error
 
+    @staticmethod
+    def _json_body(r: httpx.Response) -> Any:
+        """Empty/non-JSON body par crash na karo (200 + empty patch common hai)."""
+        try:
+            return r.json()
+        except Exception:  # noqa: BLE001
+            return None
+
     async def _upsert_row(self, client: httpx.AsyncClient, table: str, row: Dict[str, Any]) -> bool:
         id_col, id_val = self._id_field(row)
         payload = dict(row)
@@ -125,7 +133,7 @@ class SupabaseDB:
                     headers={**self.headers, "Prefer": "return=representation"},
                     json=payload,
                 )
-                if r.status_code < 300 and r.json():
+                if r.status_code < 300 and self._json_body(r):
                     return True
             # 2) Existing row with same username -> patch it.
             r = await client.patch(
@@ -134,7 +142,7 @@ class SupabaseDB:
                 headers={**self.headers, "Prefer": "return=representation"},
                 json=payload,
             )
-            if r.status_code < 300 and r.json():
+            if r.status_code < 300 and self._json_body(r):
                 return True
             # 3) Brand-new row.
             r = await client.post(

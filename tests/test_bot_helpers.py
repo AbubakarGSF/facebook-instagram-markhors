@@ -270,3 +270,128 @@ def test_verify_blocks_platform_mismatch():
     )
     assert res["Status"] == "UNKNOWN"
     assert "mismatch" in res["Reason"]
+
+
+# ---------------------- deep-audit regressions ------------------------
+
+def test_parse_meta_plain_headers_without_dash():
+    raw = (
+        "ID: 6158\n"
+        "Username: bob\n"
+        "Country: PK\n"
+        "c_user: 6158\n"
+        "xs: secret\n"
+    )
+    meta = b.parse_meta(raw, "x.txt")
+    assert meta["ID"] == "6158"
+    assert meta["Username"] == "bob"
+    assert meta["Country"] == "PK"
+    # Cookie keys metadata me nahi ghusti.
+    assert "c_user" not in meta and "xs" not in meta
+    # Lowercase header bhi canonical field me normalize hota hai.
+    low = b.parse_meta("country: pk\nyear: 2016\n", "y.txt")
+    assert low["Country"] == "pk" and low["Year"] == "2016"
+
+
+def test_meta_first_is_case_insensitive():
+    meta = {"Access Token": "TOKEN123", "Token": ""}
+    assert b._meta_first(meta, "access token", "access_token", "token") == "TOKEN123"
+    assert b._meta_first({"access_token": "abc"}, "Access Token") == "abc"
+    assert b._meta_first({}, "token") == ""
+
+
+def test_strict_filters_skip_missing_country_and_year():
+    filt = {"countries": ["PK"], "years": ["2015"], "min_followers": 0}
+    ok, note = b._filter_account({"country": "", "year": "2015"}, {}, filt)
+    assert ok is False and "missing" in note
+    ok, note = b._filter_account({"country": "PK", "year": ""}, {}, filt)
+    assert ok is False and "missing" in note
+    assert b._filter_account({"country": "PK", "year": "2015"}, {}, filt)[0] is True
+    # Country case-insensitive match.
+    assert b._filter_account({"country": "pk", "year": "2015"}, {}, filt)[0] is True
+
+
+def test_media_url_validation_rejects_private_hosts():
+    assert b._valid_media_url("https://cdn.example.com/a.jpg") is True
+    assert b._valid_media_url("http://localhost/a.jpg") is False
+    assert b._valid_media_url("http://127.0.0.1/a.jpg") is False
+    assert b._valid_media_url("http://10.0.0.5/a.jpg") is False
+    assert b._valid_media_url("ftp://example.com/a.jpg") is False
+    assert b._valid_media_url("http://intranet/a.jpg") is False
+
+
+def test_set_state_preserves_command_rate_limit(monkeypatch):
+    b.user_state.clear()
+    monkeypatch.setattr(b, "USER_CMD_COOLDOWN", 10.0)
+    assert b.check_user_rate_limit(1) is True
+    b._set_state(1, mode="rework", live=False)
+    # Replacing the dict used to wipe last_cmd and bypass the cooldown.
+    assert b.check_user_rate_limit(1) is False
+    assert b.user_state[1]["last_cmd"] > 0
+    b.user_state.clear()
+
+
+def test_cleanup_expires_rate_only_state(monkeypatch):
+    b.user_state.clear()
+    now = b.time.time()
+    b.user_state[2] = {"last_cmd": now - 10 * 60 * 60}
+    b.user_state[3] = {"at": now}
+    monkeypatch.setattr(b, "USER_STATE_TTL_MIN", 30)
+    b.cleanup_user_state()
+    assert 2 not in b.user_state
+    assert 3 in b.user_state
+    b.user_state.clear()
+
+
+def test_verify_closes_every_created_client():
+    class TrackClient:
+        made = 0
+        closed = 0
+
+        def __init__(self, proxy=None):
+            self.proxy = proxy
+            TrackClient.made += 1
+
+        async def aclose(self):
+            TrackClient.closed += 1
+
+    class TrackPlatform:
+        NAME = "facebook"
+
+        def http_client(self, proxy=None):
+            return TrackClient(proxy)
+
+        async def live_check(self, client, cookies):
+            return {"Status": "LIVE", "Platform": "facebook", "Reason": ""}
+
+    res = asyncio.run(
+        b._verify_cookie(
+            TrackPlatform(),
+            {"c_user": "1", "xs": "x"},
+            proxy="socks5://1.2.3.4:1",
+        )
+    )
+    assert res["Status"] == "LIVE"
+    # Proxy LIVE par direct client banta hi nahi; jo bana wo close ho.
+    assert TrackClient.made == 1
+    assert TrackClient.closed == 1
+
+
+def test_fb_weak_notifications_marker_alone_is_not_live():
+    async def run():
+        client = _client(
+            lambda request: httpx.Response(
+                200,
+                text="<html><title>Facebook</title>"
+                "<script>var x='notifications';</script></html>",
+            )
+        )
+        try:
+            return await FacebookPlatform().live_check_impl(
+                client, {"c_user": "1", "xs": "x"}
+            )
+        finally:
+            await client.aclose()
+
+    res = asyncio.run(run())
+    assert res["Status"] == "UNKNOWN"

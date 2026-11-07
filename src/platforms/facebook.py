@@ -67,15 +67,21 @@ class FacebookPlatform(BasePlatform):
                     "checkpoint",
                 )
                 login_hit = any(m in low for m in login_markers) or "login" in path
-                # Logged-in markers -> cookie alive.
-                live_markers = (
+                # Strong markers (session-only) vs weak markers (login/JS pages
+                # par bhi mil sakte hain). Sirf weak marker par LIVE claim karna
+                # false positive tha; ab strong chahiye ya do weak.
+                strong_markers = (
                     "/logout.php",
                     "mbasic_logout_button",
-                    '"userid"',
                     "facebook.com/home.php",
+                )
+                weak_markers = (
+                    '"userid"',
                     "notifications",
                 )
-                live_hit = any(m in low for m in live_markers)
+                strong_hit = any(m in low for m in strong_markers)
+                weak_hits = sum(1 for m in weak_markers if m in low)
+                live_hit = strong_hit or weak_hits >= 2
 
                 if live_hit:
                     uname_match = re.search(r"<title>([^<]{1,80})</title>", html, re.I)

@@ -6,6 +6,7 @@ Same logic as evilmarkhors bot: PROXIES env, PROXY_TYPE, PROXY_FILE, /proxy add 
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 from typing import List, Optional, Tuple
@@ -25,6 +26,7 @@ PROXY_SKIPPED: List[str] = []
 PROXY_HINT: set = set()
 RUNTIME_PROXY_FILE = "proxies.txt"
 PROXY_DISABLED = False
+_PROXIES_LOADED = False
 
 
 def check_socksio() -> bool:
@@ -200,7 +202,9 @@ def _colon_proxy_parts(s: str) -> Optional[Tuple[str, str, str, str]]:
 
 def load_proxies() -> List[str]:
     """PROXIES env + PROXY_FILE + proxies.txt (runtime), dedupe."""
-    global PROXIES
+    global PROXIES, _PROXIES_LOADED
+    # Invalid entries ka list har reload par barhta tha (memory + log spam).
+    PROXY_SKIPPED.clear()
     raw = os.getenv("PROXIES", "")
     items = [x for x in re.split(r"[\s,]+", raw or "") if x]
 
@@ -224,6 +228,7 @@ def load_proxies() -> List[str]:
             seen.add(u)
             out.append(u)
     PROXIES = out
+    _PROXIES_LOADED = True
     return PROXIES
 
 
@@ -254,7 +259,26 @@ def get_active_proxies() -> List[str]:
     """Proxies that may actually be used right now (respects /proxy off)."""
     if PROXY_DISABLED:
         return []
-    return list(PROXIES or load_proxies())
+    # Sirf pehli baar load karo. PROXIES khaali hone par har verify par file
+    # reload + invalid warnings repeat hote the (log spam / IO).
+    if not PROXIES and not _PROXIES_LOADED:
+        load_proxies()
+    return list(PROXIES)
+
+
+def pick_proxy() -> Optional[str]:
+    """PROXY_MODE ke hisaab se ek proxy choose karo.
+
+    - rotate (default): random
+    - first / single / sticky: pehla configured proxy
+    """
+    proxies = get_active_proxies()
+    if not proxies:
+        return None
+    mode = os.getenv("PROXY_MODE", "rotate").strip().lower()
+    if mode in ("first", "single", "sticky"):
+        return proxies[0]
+    return random.choice(proxies)
 
 
 def set_proxy_enabled(enabled: bool) -> None:
