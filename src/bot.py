@@ -438,6 +438,51 @@ def _detect_platform_from_name(name: str) -> Optional[str]:
     return None
 
 
+def _cookie_platform_hint(cookies: Dict[str, str]) -> Optional[str]:
+    """Cookie keys se platform: 'facebook', 'instagram', 'mixed' ya None."""
+    fb = any(cookies.get(k) for k in ("c_user", "xs"))
+    ig = any(cookies.get(k) for k in ("sessionid", "ds_user_id"))
+    if fb and ig:
+        return "mixed"
+    if fb:
+        return "facebook"
+    if ig:
+        return "instagram"
+    return None
+
+
+def resolve_platform(
+    name: str,
+    cookies: Dict[str, str],
+    explicit: Optional[str] = None,
+) -> tuple:
+    """Ek file ka sahi platform decide karo.
+
+    Priority: cookie keys > explicit (campaign) > filename.
+    Cookie keys sabse strong evidence hain, is liye galat site ki check nahi hoti.
+
+    Returns (platform_or_None, source, reason).
+    """
+    hint = _cookie_platform_hint(cookies)
+    name_hint = _detect_platform_from_name(name)
+
+    if hint == "mixed":
+        return None, "cookie", "file me Facebook aur Instagram dono ke cookies mile (mixed)"
+    if hint in ("facebook", "instagram"):
+        if explicit in ("facebook", "instagram") and explicit != hint:
+            return None, "mismatch", (
+                f"cookie {hint} ki hai lekin platform {explicit} set hai"
+            )
+        return hint, "cookie", ""
+    if explicit in ("facebook", "instagram"):
+        return explicit, "config", ""
+    if name_hint:
+        return name_hint, "filename", ""
+    return None, "unknown", (
+        "FB (c_user/xs) ya IG (sessionid/ds_user_id) cookie keys nahi mili"
+    )
+
+
 def _to_int(value: Any, default: int = 0) -> int:
     """'1,234 followers' -> 1234; invalid -> default."""
     try:
@@ -1717,8 +1762,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if mode == "campaign":
             cfg = CAMPS.get(uid)
             accounts = []
+            skipped_platform = 0
             for name, _out, _status, cookies, meta in results:
                 if not cookies:
+                    continue
+                # Mixed/wrong-platform files must not enter this campaign.
+                file_platform = str(meta.get("Platform", "") or "").lower()
+                if file_platform not in ("", cfg["platform"]):
+                    skipped_platform += 1
+                    logger.warning(
+                        "campaign skip %s: file platform=%s campaign=%s",
+                        name, file_platform, cfg["platform"],
+                    )
                     continue
                 uname = str(
                     meta.get("Username")
@@ -1738,10 +1793,21 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 accounts = accounts[: cfg["limit"]]
 
             if not accounts:
-                await msg.edit_text("Campaign: koi valid cookies nahi mili.")
+                await msg.edit_text(
+                    "Campaign: koi valid cookies nahi mili."
+                    + (
+                        f"\n{skipped_platform} files ka platform match nahi hua "
+                        f"({cfg['platform']} campaign)."
+                        if skipped_platform else ""
+                    )
+                )
                 return
 
-            await msg.edit_text(f"Campaign shuru: {len(accounts)} accounts")
+            note = (
+                f" | {skipped_platform} skipped (platform mismatch)"
+                if skipped_platform else ""
+            )
+            await msg.edit_text(f"Campaign shuru: {len(accounts)} accounts{note}")
             CAMPRUN[uid] = {"stop": False}
             try:
                 await _campaign_loop(uid, cfg, accounts, CAMPRUN[uid], update=update, progress_msg=msg)
@@ -1797,6 +1863,20 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
     - DEAD mile to turant return (cookie hi dead hai, route change ka faida nahi).
     - Dono route fail ho to detailed reason return.
     """
+    hint = _cookie_platform_hint(cookies)
+    if hint == "mixed":
+        return {
+            "Status": "UNKNOWN",
+            "Platform": platform_obj.NAME,
+            "Reason": "mixed FB + IG cookies — verify nahi kiya",
+        }
+    if hint and hint != platform_obj.NAME:
+        return {
+            "Status": "UNKNOWN",
+            "Platform": platform_obj.NAME,
+            "Reason": f"platform mismatch: file {hint} cookies, checker {platform_obj.NAME}",
+        }
+
     routes = []
     if proxy:
         try:
@@ -1890,25 +1970,39 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
 
 async def _process_one(name: str, raw: str, state: dict) -> tuple:
     """Process a single cookie file."""
-    platform = _detect_platform_from_name(name)
-    if not platform:
-        platform = state.get("platform") or "instagram"
-
-    platform_obj = get_platform(platform)
     bp = BasePlatform()
     cookie_data, cookie_lines = bp.parse_cookie_file(raw)
     meta = parse_meta(raw, name)
 
     if not cookie_lines:
+        name_platform = _detect_platform_from_name(name) or "unknown"
         detail = (
             "NO COOKIES FOUND\n"
             f"File: {name}\n"
-            f"Detected platform: {platform}\n"
+            f"Detected platform: {name_platform}\n"
             f"File size: {len(raw)} bytes\n\n"
             "--- first 500 chars ---\n"
             + (raw[:500] if raw else "(file empty)")
         )
         return (name, detail, "NOCOOKIES", {}, {})
+
+    # Cookie keys are the strongest signal: a Facebook file must never be
+    # checked with the Instagram verifier (that used to show false DEAD).
+    platform, source, detect_reason = resolve_platform(
+        name, cookie_data, state.get("platform")
+    )
+    if not platform:
+        status = "UNKNOWN"
+        meta.update({
+            "Status": status,
+            "Reason": f"platform detect nahi hua: {detect_reason}",
+            "Platform": "unknown",
+            "Checked": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        })
+        output = build_cookie_file(meta, cookie_lines)
+        return (name, output, status, cookie_data, meta)
+
+    platform_obj = get_platform(platform)
 
     # Live check if enabled — proxy + direct dono routes try hote hain
     want_live = bool(state.get("live")) or state.get("mode") == "verify"
@@ -1926,6 +2020,7 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
         "Status": status,
         "Reason": check.get("Reason", "" if want_live else "live check off (rework only)"),
         "Platform": platform,
+        "Platform source": source,
         "Checked": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     })
     if check.get("via"):

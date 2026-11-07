@@ -86,6 +86,19 @@ automatically lagta hai. Band karna ho to `/camp branding off`
 - `/proxy status|add|test|on|off|detect`
 - `/netcheck`, `/diag`, `/status`
 
+## Platform detection (verify)
+
+Har cookie file ka platform **cookie keys se** decide hota hai, filename se nahi:
+
+- Facebook: `c_user` / `xs`
+- Instagram: `sessionid` / `ds_user_id`
+
+Priority: cookie keys > campaign platform > filename. Agar file me FB aur IG
+dono ke keys milen, ya campaign platform cookie se match na kare, to file
+verify nahi hoti — status `UNKNOWN` milta hai (false `DEAD` nahi). Is liye
+`1.txt`, numeric user-id files aur galat naam wali files bhi sahi site se
+check hoti hain.
+
 ## DB behaviour (important)
 
 - Verify ke baad **LIVE, DEAD aur UNKNOWN teeno** rows insert/update hoti hain.

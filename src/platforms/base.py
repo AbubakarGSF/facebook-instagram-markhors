@@ -148,6 +148,12 @@ class BasePlatform:
                 }
 
             last_result = result
+            # Local pre-checks (missing cookies / wrong platform) should not
+            # burn 1s+2s retries; they are not network glitches.
+            if result.get("NoRetry"):
+                result.pop("NoRetry", None)
+                return result
+
             status = result.get("Status")
             if status in ("LIVE", "DEAD"):
                 return result

@@ -27,9 +27,13 @@ class InstagramPlatform(BasePlatform):
 
         if not cookies.get("sessionid"):
             return {
-                "Status": "DEAD",
+                "Status": "UNKNOWN",
                 "Platform": "instagram",
-                "Reason": "missing cookie: sessionid",
+                "Reason": (
+                    "missing IG cookie: sessionid "
+                    "(galat platform / incomplete export)"
+                ),
+                "NoRetry": True,
             }
 
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())

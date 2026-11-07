@@ -33,9 +33,13 @@ class FacebookPlatform(BasePlatform):
         missing = [k for k in ("c_user", "xs") if not cookies.get(k)]
         if missing:
             return {
-                "Status": "DEAD",
+                "Status": "UNKNOWN",
                 "Platform": "facebook",
-                "Reason": "missing cookie(s): " + ",".join(missing),
+                "Reason": (
+                    "missing FB cookie(s): " + ",".join(missing)
+                    + " (galat platform / incomplete export)"
+                ),
+                "NoRetry": True,
             }
 
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
