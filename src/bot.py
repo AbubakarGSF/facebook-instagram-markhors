@@ -22,7 +22,7 @@ import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config.settings import ADMIN_IDS, BOT_VERSION, CREDIT, CONCURRENCY, MAX_FILES, PROXIES, STATE_DIR, WEBSITE, ZIP_MAX_TOTAL
+from config.settings import ADMIN_IDS, BOT_VERSION, CREDIT, CONCURRENCY, MAX_FILES, STATE_DIR, WEBSITE, ZIP_MAX_TOTAL
 from src.database.supabase import SupabaseDB
 from src.platforms.base import BasePlatform
 from src.platforms.facebook import FacebookPlatform
@@ -286,6 +286,16 @@ def safe_zip_entry_name(name: str) -> str:
     """Sanitize zip entry name to prevent path traversal (zip slip)."""
     # Only use the basename - strips any directory components
     return os.path.basename(name.replace("\\", "/"))
+
+
+def _pick_proxy() -> Optional[str]:
+    """Loaded proxy list se ek valid proxy choose karo (env string se nahi)."""
+    try:
+        proxies = load_proxies()
+    except Exception:  # noqa: BLE001
+        logger.exception("load_proxies failed")
+        proxies = []
+    return random.choice(proxies) if proxies else None
 
 
 def safe_text(text: str, max_len: int = 4096) -> str:
@@ -784,9 +794,7 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
             ck = decrypt_cookies(ck)
 
         # Pick a proxy if available
-        proxy = None
-        if PROXIES:
-            proxy = random.choice(PROXIES)
+        proxy = _pick_proxy()
 
         check = await _verify_cookie(platform_obj, ck, proxy=proxy)
 
@@ -876,7 +884,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cleanup_user_state()
 
     # Check if proxies are configured - without them all traffic goes direct
-    if not PROXIES:
+    if not load_proxies():
         await msg.edit_text(
             "⚠️ No proxies configured! All Facebook/Instagram traffic will go direct.\n"
             "Add proxies with /proxy add before uploading cookies."
@@ -917,7 +925,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         result = await _process_one(name, raw, state)
                     except Exception as e:  # noqa: BLE001
                         logger.exception("process failed: %s", name)
-                        result = (name, "", f"ERROR: {type(e).__name__}: {str(e)[:60]}")
+                        detail = (
+                            "REWORK ERROR\n"
+                            f"File: {name}\n"
+                            f"{type(e).__name__}: {e}\n\n"
+                            "--- first 500 chars ---\n"
+                            + (raw[:500] if raw else "(file empty)")
+                        )
+                        result = (name, detail, f"ERROR: {type(e).__name__}")
                     results.append(result)
         else:
             with open(path, encoding="utf-8", errors="ignore") as f:
@@ -926,7 +941,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result = await _process_one(doc.file_name, raw, state)
             except Exception as e:  # noqa: BLE001
                 logger.exception("process failed: %s", doc.file_name)
-                result = (doc.file_name, "", f"ERROR: {type(e).__name__}: {str(e)[:60]}")
+                detail = (
+                    "REWORK ERROR\n"
+                    f"File: {doc.file_name}\n"
+                    f"{type(e).__name__}: {e}\n\n"
+                    "--- first 500 chars ---\n"
+                    + (raw[:500] if raw else "(file empty)")
+                )
+                result = (doc.file_name, detail, f"ERROR: {type(e).__name__}")
             results.append(result)
 
         # If campaign mode, run campaign loop
@@ -942,20 +964,35 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # Create output zip for rework/verify mode
             out_path = os.path.join(tmp, "out.zip")
+            counts = {"working": 0, "dead": 0, "unknown": 0, "errors": 0}
             with _zipfile.ZipFile(out_path, "w", _zipfile.ZIP_DEFLATED) as zout:
                 for name, output, status in results:
-                    folder = "working" if status == "LIVE" else ("dead" if status == "DEAD" else "unknown")
+                    if status == "LIVE":
+                        folder = "working"
+                    elif status == "DEAD":
+                        folder = "dead"
+                    elif status.startswith("ERROR") or status == "NOCOOKIES":
+                        folder = "errors"
+                    else:
+                        folder = "unknown"
+                    counts[folder] += 1
                     # Path traversal protection: use basename only
                     safe_name = safe_zip_entry_name(name)
                     zout.writestr(f"{folder}/{safe_name}", output)
 
+            summary = (
+                f"Rework complete | {len(results)} files\n"
+                f"working: {counts['working']} | dead: {counts['dead']} | "
+                f"unknown: {counts['unknown']} | errors: {counts['errors']}\n"
+                f"Live check: {'ON' if (state.get('live') or mode == 'verify') else 'OFF (/live on)'}"
+            )
             await context.bot.send_document(
                 update.effective_chat.id,
                 document=open(out_path, "rb"),
                 filename="reworked.zip",
-                caption=f"Rework complete | {len(results)} files",
+                caption=summary,
             )
-            await msg.edit_text("Complete")
+            await msg.edit_text(summary)
 
     except Exception as e:
         logger.exception("handle_file")
@@ -974,8 +1011,21 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
     """
     routes = []
     if proxy:
-        routes.append(("proxy", platform_obj.http_client(proxy=proxy)))
-    routes.append(("direct", platform_obj.http_client()))
+        try:
+            routes.append(("proxy", platform_obj.http_client(proxy=proxy)))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("proxy client create failed (%s): %s", proxy, e)
+    try:
+        routes.append(("direct", platform_obj.http_client()))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("direct client create failed: %s", e)
+
+    if not routes:
+        return {
+            "Status": "UNKNOWN",
+            "Platform": platform_obj.NAME,
+            "Reason": "no http client could be created",
+        }
 
     results = []
     final = None
@@ -1051,21 +1101,34 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
     meta = parse_meta(raw, name)
 
     if not cookies:
-        return (name, "", "no cookies")
+        detail = (
+            "NO COOKIES FOUND\n"
+            f"File: {name}\n"
+            f"Detected platform: {platform}\n"
+            f"File size: {len(raw)} bytes\n\n"
+            "--- first 500 chars ---\n"
+            + (raw[:500] if raw else "(file empty)")
+        )
+        return (name, detail, "NOCOOKIES")
 
     # Live check if enabled — proxy + direct dono routes try hote hain
     want_live = state.get("live", False) or state.get("mode") == "verify"
     if want_live and platform_obj:
-        proxy = random.choice(PROXIES) if PROXIES else None
+        proxy = _pick_proxy()
         check = await _verify_cookie(platform_obj, cookies, proxy=proxy)
         status = check.get("Status", "UNKNOWN")
         reason = check.get("Reason", "")
         meta.update(check)
     else:
         status = "UNKNOWN"
-        reason = "live check off"
+        reason = "live check off (rework only)"
 
-    meta.update({"Status": status, "Reason": reason})
+    meta.update({
+        "Status": status,
+        "Reason": reason,
+        "Platform": platform,
+        "Checked": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+    })
     output = build_cookie_file(meta, cookies)
 
     # Save LIVE accounts to DB
