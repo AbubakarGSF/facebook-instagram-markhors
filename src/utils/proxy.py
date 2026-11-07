@@ -113,11 +113,17 @@ def _colon_proxy_parts(s: str) -> Optional[Tuple[str, str, str, str]]:
             return None
         port, creds = bits[0], bits[1:]
     else:
+        # Unbracketed host:port[:user[:pass]]
+        # For unbracketed IPv6 like 2001:db8::1:1080, the port is second-to-last segment
+        # and creds are after that (if any)
         bits = s.split(":")
-        if len(bits) in (2, 3, 4) and bits[1].isdigit():
-            host, port, creds = bits[0], bits[1], bits[2:]
-        else:
+        if len(bits) < 2:
             return None
+        port_candidate = bits[-2]
+        if not port_candidate.isdigit():
+            return None
+        host = ":".join(bits[:-1])
+        creds = bits[-1:]
     if not host or not port.isdigit() or not (0 < int(port) < 65536):
         return None
     return (host, port, creds[0] if len(creds) >= 1 else "", creds[1] if len(creds) >= 2 else "")
