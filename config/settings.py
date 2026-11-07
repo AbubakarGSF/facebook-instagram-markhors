@@ -48,7 +48,7 @@ ZIP_MAX_TOTAL = int(os.getenv("ZIP_MAX_TOTAL", str(256 * 1024 * 1024)))  # 256MB
 ZIP_MAX_FILE = int(os.getenv("ZIP_MAX_FILE", str(16 * 1024 * 1024)))  # 16MB per entry
 
 # Bot version
-BOT_VERSION = "2.1.0"
+BOT_VERSION = "2.2.0"
 
 # Encryption key for cookie storage at rest
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")

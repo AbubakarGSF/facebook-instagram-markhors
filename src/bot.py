@@ -298,6 +298,84 @@ def _pick_proxy() -> Optional[str]:
     return random.choice(proxies) if proxies else None
 
 
+def _status_folder(status: str) -> str:
+    """Result status ko output folder name me map karo."""
+    if status == "LIVE":
+        return "working"
+    if status == "DEAD":
+        return "dead"
+    if status.startswith("ERROR") or status == "NOCOOKIES":
+        return "errors"
+    return "unknown"
+
+
+class ProgressReporter:
+    """Throttled live progress message editor (Telegram edit flood se bachne ke liye)."""
+
+    def __init__(self, message, title: str, total: int, update_every: Optional[float] = None):
+        self.msg = message
+        self.title = title
+        self.total = max(int(total or 0), 1)
+        self.update_every = (
+            update_every
+            if update_every is not None
+            else float(os.getenv("PROGRESS_UPDATE_SEC", "3"))
+        )
+        self.start = time.time()
+        self.last = 0.0
+        self.last_text = ""
+
+    @staticmethod
+    def _fmt(seconds: float) -> str:
+        seconds = int(max(seconds, 0))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    async def update(
+        self,
+        processed: int,
+        counts: Dict[str, int],
+        current: str = "",
+        last: str = "",
+        force: bool = False,
+    ) -> None:
+        now = time.time()
+        if not force and (now - self.last) < self.update_every:
+            return
+        self.last = now
+
+        elapsed = now - self.start
+        rate = processed / elapsed if elapsed > 0 else 0.0
+        eta = (self.total - processed) / rate if rate > 0 else 0.0
+        pct = min(processed * 100.0 / self.total, 100.0)
+        filled = int(pct / 5)
+        bar = "\u2588" * filled + "\u2591" * (20 - filled)
+
+        text = (
+            f"{self.title}\n"
+            f"[{bar}] {processed}/{self.total} ({pct:.0f}%)\n"
+            f"\u2705 working: {counts.get('working', 0)}   "
+            f"\u274c dead: {counts.get('dead', 0)}\n"
+            f"\u2753 unknown: {counts.get('unknown', 0)}   "
+            f"\u26a0\ufe0f errors: {counts.get('errors', 0)}\n"
+            f"\u23f1 elapsed {self._fmt(elapsed)} | ETA {self._fmt(eta)} | {rate:.1f}/s"
+        )
+        if current:
+            text += f"\n\U0001F4C4 current: {current[:70]}"
+        if last:
+            text += f"\n\U0001F50E last: {last[:90]}"
+
+        if text == self.last_text:
+            return
+        self.last_text = text
+        try:
+            await self.msg.edit_text(text)
+        except Exception as e:  # noqa: BLE001
+            # "Message is not modified" / flood wait — progress best-effort hai
+            logger.debug("progress edit skipped: %s", e)
+
+
 def safe_text(text: str, max_len: int = 4096) -> str:
     """Sanitize text input - strip dangerous characters and limit length."""
     if not text:
@@ -761,8 +839,15 @@ async def stopcamp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============================ CAMPAIGN LOOP ============================
 
-async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
-    """Campaign loop: verify each account, post text, save to DB."""
+async def _campaign_loop(
+    uid: int,
+    cfg: dict,
+    accounts: list,
+    state: dict,
+    update: Optional[Update] = None,
+    progress_msg=None,
+):
+    """Campaign loop: verify each account, post text, save to DB (live progress ke saath)."""
     platform = cfg["platform"]
     platform_obj = get_platform(platform)
     if not platform_obj:
@@ -777,88 +862,155 @@ async def _campaign_loop(uid: int, cfg: dict, accounts: list, state: dict):
     prog_total = len(accounts)
     posted_count = 0
     failed_count = 0
+    skipped_count = 0
+    done_count = 0
+    last_note = ""
+
+    if progress_msg is None and update is not None:
+        progress_msg = await update.message.reply_text("Campaign shuru ho raha hai...")
+    reporter = (
+        ProgressReporter(
+            progress_msg,
+            f"\U0001F4E3 CAMPAIGN: {cfg.get('name') or platform} ({platform})",
+            prog_total,
+        )
+        if progress_msg is not None
+        else None
+    )
+    if reporter:
+        await reporter.update(
+            0,
+            {"working": 0, "dead": 0, "unknown": 0, "errors": 0},
+            last="accounts verify ho rahe hain...",
+            force=True,
+        )
 
     sem = asyncio.Semaphore(max(CONCURRENCY, 1))
 
     async def process_account(acc):
-        nonlocal posted_count, failed_count
-        if state.get("stop"):
+        nonlocal posted_count, failed_count, skipped_count, done_count, last_note
+        if state.get("stop") or CAMPRUN.get(uid, {}).get("stop"):
+            skipped_count += 1
+            last_note = "STOP requested"
             return
 
-        ck = acc.get("cookies", {})
-        if not ck:
-            failed_count += 1
-            return
-
-        # Decrypt cookies if they were stored encrypted
-        if _db and ck:
-            ck = decrypt_cookies(ck)
-
-        # Pick a proxy if available
-        proxy = _pick_proxy()
-
-        check = await _verify_cookie(platform_obj, ck, proxy=proxy)
-
-        status = check.get("Status", "UNKNOWN")
-        if status != "LIVE":
-            failed_count += 1
-            return
-
-        # Check filters
-        username = safe_text(check.get("username", ""))
-        country = check.get("country", "")
-        followers = int(check.get("Followers", 0) or 0)
-
-        if filt.get("countries") and country not in filt["countries"]:
-            return
-        if filt.get("min_followers", 0) > followers:
-            return
-
-        # Post (fresh client — verify ke clients already closed hain)
-        text = random.choice(texts)
-        post_proxy = proxy if check.get("via") == "proxy" else None
-        cl = platform_obj.http_client(proxy=post_proxy)
+        username = str(acc.get("username", "") or "")
         try:
-            ok, post_id, err = await platform_obj.post(cl, ck, safe_text(text))
-        finally:
-            await cl.aclose()
+            if state.get("stop") or CAMPRUN.get(uid, {}).get("stop"):
+                skipped_count += 1
+                last_note = "STOP requested"
+                return
 
-        if ok:
-            posted_count += 1
-            # Save to DB
-            if _db:
-                row = {
-                    "username": username,
-                    "fb_id": check.get("fb_id", "") if platform == "facebook" else "",
-                    "ig_id": check.get("ig_id", "") if platform == "instagram" else "",
-                    "cookies": encrypt_cookies(ck),
-                    "country": country,
-                    "followers": followers,
-                    "verified": str(check.get("Verified", "false")).lower() == "true",
-                    "status": "live",
-                    "source": "campaign",
-                    "last_post": time.time(),
-                }
-                table = "fb_accounts" if platform == "facebook" else "ig_accounts"
-                async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as db_cl:
-                    await _db.upsert(db_cl, table, [row])
-        else:
+            ck = acc.get("cookies", {})
+            if not ck:
+                failed_count += 1
+                last_note = f"NO COOKIES | {username}"
+                return
+
+            # Decrypt cookies if they were stored encrypted
+            if _db and ck:
+                ck = decrypt_cookies(ck)
+
+            proxy = _pick_proxy()
+            check = await _verify_cookie(platform_obj, ck, proxy=proxy)
+
+            status = check.get("Status", "UNKNOWN")
+            uname = safe_text(check.get("username", "") or username)
+            if status != "LIVE":
+                failed_count += 1
+                last_note = f"{status} ({check.get('via', '-')}) {check.get('Reason', '')[:40]} | {uname}"
+                return
+
+            # Check filters
+            country = check.get("country", "")
+            try:
+                followers = int(check.get("Followers", 0) or 0)
+            except (TypeError, ValueError):
+                followers = 0
+
+            if filt.get("countries") and country not in filt["countries"]:
+                skipped_count += 1
+                last_note = f"FILTER country={country} | {uname}"
+                return
+            if filt.get("min_followers", 0) > followers:
+                skipped_count += 1
+                last_note = f"FILTER followers={followers} | {uname}"
+                return
+
+            # Post (fresh client — verify ke clients already closed hain)
+            text = random.choice(texts)
+            post_proxy = proxy if check.get("via") == "proxy" else None
+            cl = platform_obj.http_client(proxy=post_proxy)
+            try:
+                ok, post_id, err = await platform_obj.post(cl, ck, safe_text(text))
+            finally:
+                await cl.aclose()
+
+            if ok:
+                posted_count += 1
+                last_note = f"POSTED via {check.get('via', '-')} | {uname}"
+                if _db:
+                    row = {
+                        "username": uname,
+                        "fb_id": check.get("fb_id", "") if platform == "facebook" else "",
+                        "ig_id": check.get("ig_id", "") if platform == "instagram" else "",
+                        "cookies": encrypt_cookies(ck),
+                        "country": country,
+                        "followers": followers,
+                        "verified": str(check.get("Verified", "false")).lower() == "true",
+                        "status": "live",
+                        "source": "campaign",
+                        "last_post": time.time(),
+                    }
+                    table = "fb_accounts" if platform == "facebook" else "ig_accounts"
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as db_cl:
+                        await _db.upsert(db_cl, table, [row])
+            else:
+                failed_count += 1
+                last_note = f"POST FAILED: {err or 'unknown'} | {uname}"
+        except Exception as e:  # noqa: BLE001
+            logger.exception("campaign account failed: %s", username)
             failed_count += 1
+            last_note = f"ERROR {type(e).__name__} | {username}"
+        finally:
+            done_count += 1
+            if reporter:
+                await reporter.update(
+                    done_count,
+                    {
+                        "working": posted_count,
+                        "dead": failed_count,
+                        "unknown": skipped_count,
+                        "errors": 0,
+                    },
+                    last=last_note,
+                )
 
         # Delay between accounts
         lo, hi = cfg["delay"]
         await asyncio.sleep(random.uniform(lo, hi))
 
-    # Process accounts with concurrency limit
-    tasks = [process_account(acc) for acc in accounts]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    async def run_account(acc):
+        async with sem:
+            await process_account(acc)
 
-    await update.message.reply_text(
+    # Process accounts with concurrency limit
+    await asyncio.gather(*(run_account(acc) for acc in accounts), return_exceptions=True)
+
+    summary = (
         f"Campaign complete!\n"
         f"Posted: {posted_count}\n"
         f"Failed: {failed_count}\n"
+        f"Skipped (filter): {skipped_count}\n"
         f"Total: {prog_total}"
     )
+    if update is not None:
+        await update.message.reply_text(summary)
+    elif progress_msg is not None:
+        try:
+            await progress_msg.edit_text(summary)
+        except Exception:  # noqa: BLE001
+            pass
     # Clear campaign mode
     user_state.pop(uid, None)
 
@@ -908,6 +1060,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         results = []
+        progress_counts = {"working": 0, "dead": 0, "unknown": 0, "errors": 0}
 
         if doc.file_name.lower().endswith(".zip"):
             with _zipfile.ZipFile(path) as z:
@@ -920,7 +1073,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"exceeds limit {ZIP_MAX_TOTAL // (1024*1024)}MB"
                     )
                     return
-                for name in names[:MAX_FILES]:
+                names = names[:MAX_FILES]
+                live_on = bool(state.get("live") or mode == "verify")
+                reporter = ProgressReporter(
+                    msg,
+                    f"\U0001F4E6 {mode.upper()} processing" + (" + live verify" if live_on else ""),
+                    len(names),
+                )
+                await reporter.update(0, progress_counts, last="shuru ho raha hai...", force=True)
+                for i, name in enumerate(names, 1):
                     raw = z.read(name).decode("utf-8", "ignore")
                     try:
                         result = await _process_one(name, raw, state)
@@ -933,8 +1094,20 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "--- first 500 chars ---\n"
                             + (raw[:500] if raw else "(file empty)")
                         )
-                        result = (name, detail, f"ERROR: {type(e).__name__}")
+                        result = (name, detail, f"ERROR: {type(e).__name__}", {}, {})
                     results.append(result)
+                    folder = _status_folder(result[2])
+                    progress_counts[folder] += 1
+                    _meta = result[4] if len(result) > 4 else {}
+                    who = str(_meta.get("Username", "") or safe_zip_entry_name(name))
+                    extra = f" | ID {_meta.get('ID')}" if _meta.get("ID") else ""
+                    via = f" | via {_meta.get('Via')}" if _meta.get("Via") else ""
+                    await reporter.update(
+                        i,
+                        progress_counts,
+                        current=who,
+                        last=f"{result[2]}{via}{extra} | {safe_zip_entry_name(name)}",
+                    )
         else:
             with open(path, encoding="utf-8", errors="ignore") as f:
                 raw = f.read()
@@ -949,34 +1122,35 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "--- first 500 chars ---\n"
                     + (raw[:500] if raw else "(file empty)")
                 )
-                result = (doc.file_name, detail, f"ERROR: {type(e).__name__}")
+                result = (doc.file_name, detail, f"ERROR: {type(e).__name__}", {}, {})
             results.append(result)
+            progress_counts[_status_folder(result[2])] += 1
 
         # If campaign mode, run campaign loop
         if mode == "campaign" and state.get("platform"):
             cfg = CAMPS.get(uid)
             if cfg and cfg.get("texts"):
-                await update.message.reply_text(
-                    f"Campaign shuru: {len(results)} accounts\nPlatform: {cfg['platform']}"
-                )
-                await _campaign_loop(uid, cfg, results, {})
+                accounts = []
+                for name, _out, _status, cookies, meta in results:
+                    if not cookies:
+                        continue
+                    uname = str(meta.get("Username", "") or safe_zip_entry_name(name))
+                    accounts.append({"username": uname, "cookies": cookies})
+                await msg.edit_text(f"Campaign shuru: {len(accounts)} accounts")
+                CAMPRUN[uid] = {"stop": False}
+                try:
+                    await _campaign_loop(uid, cfg, accounts, CAMPRUN[uid], update=update, progress_msg=msg)
+                finally:
+                    CAMPRUN.pop(uid, None)
             else:
                 await update.message.reply_text("Campaign configs missing. /camp text bhejo pehle.")
         else:
             # Create output zip for rework/verify mode
             out_path = os.path.join(tmp, "out.zip")
-            counts = {"working": 0, "dead": 0, "unknown": 0, "errors": 0}
+            counts = progress_counts
             with _zipfile.ZipFile(out_path, "w", _zipfile.ZIP_DEFLATED) as zout:
-                for name, output, status in results:
-                    if status == "LIVE":
-                        folder = "working"
-                    elif status == "DEAD":
-                        folder = "dead"
-                    elif status.startswith("ERROR") or status == "NOCOOKIES":
-                        folder = "errors"
-                    else:
-                        folder = "unknown"
-                    counts[folder] += 1
+                for name, output, status, *_ in results:
+                    folder = _status_folder(status)
                     # Path traversal protection: use basename only
                     safe_name = safe_zip_entry_name(name)
                     zout.writestr(f"{folder}/{safe_name}", output)
@@ -1110,7 +1284,7 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
             "--- first 500 chars ---\n"
             + (raw[:500] if raw else "(file empty)")
         )
-        return (name, detail, "NOCOOKIES")
+        return (name, detail, "NOCOOKIES", {}, {})
 
     # Live check if enabled — proxy + direct dono routes try hote hain
     want_live = state.get("live", False) or state.get("mode") == "verify"
@@ -1155,7 +1329,7 @@ async def _process_one(name: str, raw: str, state: dict) -> tuple:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as cl:
             await _db.upsert(cl, table, [row])
 
-    return (name, output, status)
+    return (name, output, status, cookies, meta)
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
