@@ -64,9 +64,14 @@ class FacebookPlatform(BasePlatform):
                     'name="email"',
                     "log in to facebook",
                     "/login/?next",
-                    "checkpoint",
                 )
-                login_hit = any(m in low for m in login_markers) or "login" in path
+                # "checkpoint" sirf URL me dekho; page JS me ye word common hai
+                # aur valid session ko false DEAD bana deta tha.
+                login_hit = (
+                    any(m in low for m in login_markers)
+                    or "login" in path
+                    or "checkpoint" in path
+                )
                 # Strong markers (session-only) vs weak markers (login/JS pages
                 # par bhi mil sakte hain). Sirf weak marker par LIVE claim karna
                 # false positive tha; ab strong chahiye ya do weak.

@@ -21,8 +21,10 @@ os.environ.setdefault("USER_CMD_COOLDOWN", "0")
 os.environ.setdefault("CONTENT_COOLDOWN", "0")
 
 try:  # real package if installed
-    import telegram  # noqa: F401
-    import telegram.ext  # noqa: F401
+    import importlib
+
+    importlib.import_module("telegram")
+    importlib.import_module("telegram.ext")
 except ImportError:  # pragma: no cover - local dev environment
     tg = types.ModuleType("telegram")
 

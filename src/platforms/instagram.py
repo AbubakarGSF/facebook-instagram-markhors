@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 
 from .base import BasePlatform
+from src.utils.ratelimit import rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -191,16 +192,34 @@ class InstagramPlatform(BasePlatform):
                 },
             )
             if r.status_code != 200:
+                if r.status_code == 429:
+                    wait = rate_limiter.record_response("instagram", 429)
+                    if wait:
+                        await asyncio.sleep(min(wait, 60))
+                    return False, None, "RATE"
                 return False, None, f"HTTP {r.status_code}: {r.text[:80]}"
-            creation_id = (r.json() or {}).get("id")
+            try:
+                creation_id = (r.json() or {}).get("id")
+            except Exception:  # noqa: BLE001
+                creation_id = None
             if not creation_id:
                 return False, None, "graph: creation id nahi mila"
 
             # Graph image container ko process hone me waqt lagta hai. Direct
             # publish karne par "Media not ready" milta hai.
             status = ""
-            polls = max(int(os.getenv("IG_MEDIA_POLLS", "10") or 0), 0)
-            interval = max(float(os.getenv("IG_MEDIA_POLL_SEC", "2") or 0), 0.5)
+            try:
+                polls = max(int(os.getenv("IG_MEDIA_POLLS", "10").strip() or 0), 0)
+            except (TypeError, ValueError):
+                logger.warning("Invalid IG_MEDIA_POLLS; default 10 use ho raha hai")
+                polls = 10
+            try:
+                interval = max(
+                    float(os.getenv("IG_MEDIA_POLL_SEC", "2").strip() or 0.5), 0.5
+                )
+            except (TypeError, ValueError):
+                logger.warning("Invalid IG_MEDIA_POLL_SEC; default 2 use ho raha hai")
+                interval = 2.0
             for _ in range(polls):
                 try:
                     rs = await client.get(
@@ -231,6 +250,11 @@ class InstagramPlatform(BasePlatform):
                 if post_id:
                     return True, str(post_id), None
                 return False, None, "graph: publish id nahi mila"
+            if r2.status_code == 429:
+                wait = rate_limiter.record_response("instagram", 429)
+                if wait:
+                    await asyncio.sleep(min(wait, 60))
+                return False, None, "RATE"
             return False, None, f"publish HTTP {r2.status_code}: {r2.text[:80]}"
         except httpx.ConnectError:
             return False, None, "NET"

@@ -1,10 +1,7 @@
 """Tests for crypto module."""
 
-import importlib.util
 import os
-import sys
 
-import pytest
 from cryptography.fernet import Fernet
 
 # Set a valid ENCRYPTION_KEY before importing crypto module

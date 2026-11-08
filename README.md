@@ -1,5 +1,7 @@
 # Social Markhors Bot (Facebook + Instagram)
 
+Current version: **v2.3.5**
+
 Alag project hai `evilmarkhorsX_Bot` se. ye project sirf **Facebook aur Instagram** ke liye hai:
 - cookie rework + branding (Netscape / `key=value` / `key: value` support)
 - live check (LIVE / DEAD / UNKNOWN)
@@ -40,7 +42,11 @@ Optional: `HEALTH_CHECK_PORT` / Railway `PORT`, `CONCURRENCY`, `TIMEOUT`,
 `ACC_TIMEOUT`, `RETRIES`, `POST_MIN`, `POST_MAX`, `MAX_FILES`, `FILE_TIMEOUT`,
 `CONTENT_COOLDOWN`, `VERIFY_SLOW_RETRY_SEC`, `VERIFY_CONFIRM_DEAD`,
 `PROGRESS_UPDATE_SEC`, `NETCHECK_ON_START`, `STATE_DIR`, `ZIP_MAX_*`,
-`IG_MEDIA_POLLS`, `IG_MEDIA_POLL_SEC`, `MAX_STATE_ENTRIES`, `MAX_TEXT_VARIANTS`.
+`IG_MEDIA_POLLS`, `IG_MEDIA_POLL_SEC`, `MAX_STATE_ENTRIES`, `MAX_TEXT_VARIANTS`,
+`DB_EXPORT_MAX_ROWS`.
+
+`ENCRYPTION_KEY` sirf non-empty nahi, **valid Fernet key** honi chahiye; invalid
+key par bot startup par hi exit karta hai (plaintext cookies save nahi hotin).
 
 `PROXY_MODE`: `rotate` (default, random per pick) ya `first` / `single` /
 `sticky` (pehla configured proxy har baar).
@@ -157,6 +163,33 @@ Cookie-only posting reliable nahi hai, is liye bot jhoot nahi bolta:
 - Campaign summary me `Unsupported (token/media missing)` alag count hota hai,
   failed posts me mix nahi hota.
 - Per-account `media_url` campaign-level URL ko override karta hai.
+
+## Hardening (v2.3.5)
+
+- **Python 3.12 compatibility**: `Tuple` import fix (Docker `python:3.12-slim`
+  par bot ab start hota hai; pehle annotation evaluation startup crash deti thi).
+- **Metadata/token parsing**: plain `Access Token:` / `Token:` headers ab
+  campaign token ke tor par parse hote hain aur cookie parser unhe cookie nahi
+  banata. File se aaya token DB me persist hota hai (empty token existing token
+  ko overwrite nahi karta).
+- **Upload limits**: single `.txt` bhi `ZIP_MAX_FILE` se capped hai; declared
+  file size pehle check hoti hai. Cookie parser max 200 cookies / 4KB value
+  leta hai (huge header abuse se bachao).
+- **Campaign validation**: `/camp delay` sirf `0-3600` range accept karta hai,
+  reversed values sort hote hain; `/camp limit` `MAX_FILES` par clamp hota hai.
+  Corrupt `camp_*.json` `_safe_camp()` se normalize hota hai.
+- **Accurate campaign progress/summary**: verify `DEAD`, verify `UNKNOWN`,
+  post failures aur internal errors alag count hote hain (pehle sab "dead" dikhte the).
+- **DB export**: paginated (`DB_EXPORT_MAX_ROWS`, default 20000) aur `year` /
+  `media_url` columns include karta hai.
+- **Netcheck**: Supabase `401` ko "reachable; auth required" dikhata hai,
+  FB/IG `4xx` ko warning (`⚠`) — sab kuch green tick nahi.
+- **State safety**: corrupt timestamps (`nan`/text) crash nahi karte; text/media
+  add karne par campaign TTL refresh hota hai.
+- **Output zip hardening**: `.` / `..` aur control characters wali entry names
+  reject hoti hain (zip-slip se bachao).
+- **Platform accuracy**: FB page body me aane wala `"checkpoint"` word ab
+  false `DEAD` nahi banata (sirf URL path checkpoint/login par DEAD).
 
 ## Run
 

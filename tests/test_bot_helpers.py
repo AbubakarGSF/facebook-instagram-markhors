@@ -3,7 +3,6 @@
 import asyncio
 
 import httpx
-import pytest
 
 import src.bot as b
 from src.platforms.base import BasePlatform
@@ -397,3 +396,183 @@ def test_fb_weak_notifications_marker_alone_is_not_live():
 
     res = asyncio.run(run())
     assert res["Status"] == "UNKNOWN"
+
+
+def test_parse_meta_plain_access_token_prefers_full_key():
+    meta = b.parse_meta(
+        "Access Token: EAAB-full\nToken: short\nc_user: 1\nxs: x\n",
+        "x.txt",
+    )
+    assert meta["Access Token"] == "EAAB-full"
+    assert meta["Token"] == "short"
+    assert b._meta_first(meta, "access token", "token") == "EAAB-full"
+
+
+def test_cookie_parser_does_not_treat_access_token_as_cookie():
+    raw = (
+        "Access Token: EAAB-full\n"
+        "api_token: abc\n"
+        "c_user=1\n"
+        "xs=x\n"
+    )
+    data, _ = BasePlatform().parse_cookie_file(raw)
+    assert data == {"c_user": "1", "xs": "x"}
+
+
+def test_cookie_parser_caps_abusive_cookie_count():
+    from src.platforms.base import MAX_COOKIES_PER_FILE
+
+    raw = "\n".join(f"c{i}=v{i}" for i in range(MAX_COOKIES_PER_FILE + 50))
+    data, _ = BasePlatform().parse_cookie_file(raw)
+    assert len(data) == MAX_COOKIES_PER_FILE
+
+
+def test_fb_body_checkpoint_word_is_not_dead():
+    async def run():
+        client = _client(
+            lambda request: httpx.Response(
+                200, text="<html><script>var checkpoint = true;</script></html>"
+            )
+        )
+        try:
+            return await FacebookPlatform().live_check_impl(
+                client, {"c_user": "1", "xs": "x"}
+            )
+        finally:
+            await client.aclose()
+
+    assert asyncio.run(run())["Status"] == "UNKNOWN"
+
+
+
+def test_delay_range_validation():
+    assert b._parse_delay_range("45-110") == [45.0, 110.0]
+    assert b._parse_delay_range("45 - 110") == [45.0, 110.0]
+    # Reversed values sort ho jate hain.
+    assert b._parse_delay_range("110-45") == [45.0, 110.0]
+    # Negative / nan / inf / missing values reject.
+    assert b._parse_delay_range("-5-10") is None
+    assert b._parse_delay_range("nan-inf") is None
+    assert b._parse_delay_range("5000-6000") is None
+    assert b._parse_delay_range("") is None
+
+
+def test_limit_clamp():
+    assert b._clamp_limit("50") == 50
+    assert b._clamp_limit("-3") == 0
+    assert b._clamp_limit("999999") == b.MAX_FILES
+    assert b._clamp_limit("abc") is None
+    assert b._clamp_limit("") is None
+
+
+def test_state_activity_tolerates_corrupt_values():
+    assert b._state_activity({"at": "bad", "last_cmd": "5.5"}) == 5.5
+    assert b._state_activity({"at": "nan", "last_content": "inf"}) == 0.0
+    assert b._state_activity({}) == 0.0
+    assert b._as_bool("false") is False
+    assert b._as_bool("yes") is True
+    assert b._as_bool(None, True) is True
+
+
+def test_process_one_can_skip_output_for_campaign():
+    res = asyncio.run(
+        b._process_one(
+            "fb_cookie.txt",
+            "c_user=100\nxs=secret\n",
+            {"mode": "campaign", "platform": "facebook"},
+            build_output=False,
+        )
+    )
+    # Rework-only (campaign parsing) me network nahi; output skip ho jata hai.
+    assert res[2] == "REWORKED"
+    assert res[1] == ""
+    assert res[4]["Platform"] == "facebook"
+
+
+def test_safe_zip_entry_name_rejects_dot_and_control_chars():
+    assert b.safe_zip_entry_name("..") == ""
+    assert b.safe_zip_entry_name(".") == ""
+    assert b.safe_zip_entry_name("folder/cookie.txt") == "cookie.txt"
+    assert b.safe_zip_entry_name("..\\evil.txt") == "evil.txt"
+    assert b.safe_zip_entry_name("bad\x00name.txt") == "badname.txt"
+
+
+def test_safe_camp_normalizes_corrupt_state():
+    cfg = b._safe_camp({
+        "platform": "twitter",
+        "source": "ftp",
+        "delay": "45-110",
+        "filter": None,
+        "limit": "999999",
+        "texts": "not-a-list",
+        "media": None,
+        "stage_at": "bad",
+        "max_parts": "x",
+        "tag": "   ",
+    })
+    assert cfg["platform"] == ""
+    assert cfg["source"] == "zip"
+    assert cfg["delay"] == [b.POST_MIN, b.POST_MAX]
+    assert cfg["filter"] == {"countries": [], "years": [], "min_followers": 0}
+    assert cfg["limit"] == b.MAX_FILES
+    assert cfg["texts"] == [] and cfg["media"] == []
+    assert cfg["stage_at"] > 0
+    assert cfg["max_parts"] >= 1
+    assert cfg["tag"]
+
+
+def test_post_signature_caps_huge_tag():
+    out = b.post_signature("x" * 5000)
+    first_line = out.splitlines()[0]
+    assert len(first_line) <= 80
+
+
+def test_process_one_persists_access_token(monkeypatch):
+    class FakeClient:
+        async def aclose(self):
+            pass
+
+    class FakePlatform:
+        NAME = "facebook"
+
+        def http_client(self, proxy=None):
+            return FakeClient()
+
+        async def live_check(self, client, cookies):
+            return {"Status": "LIVE", "Platform": "facebook", "Reason": ""}
+
+    class FakeDB:
+        def __init__(self):
+            self.rows = []
+
+        async def upsert(self, client, table, rows):
+            self.rows.append((table, rows))
+            return len(rows), None
+
+    db = FakeDB()
+    monkeypatch.setattr(b, "_db", db)
+    monkeypatch.setattr(b, "_fb_platform", FakePlatform())
+    monkeypatch.setattr(b, "_pick_proxy", lambda: None)
+
+    asyncio.run(
+        b._process_one(
+            "fb.txt",
+            "Access Token: TOKEN123\nc_user=1\nxs=x\n",
+            {"mode": "verify", "live": True},
+        )
+    )
+    assert db.rows and db.rows[0][1][0]["access_token"] == "TOKEN123"
+
+    # Token missing -> key omit ho (existing DB token overwrite na ho).
+    db.rows.clear()
+    asyncio.run(
+        b._process_one(
+            "fb.txt",
+            "c_user=1\nxs=x\n",
+            {"mode": "verify", "live": True},
+        )
+    )
+    assert "access_token" not in db.rows[0][1][0]
+
+
+

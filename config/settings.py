@@ -8,6 +8,30 @@ from typing import Set
 logger = logging.getLogger(__name__)
 
 
+def _env_int(name: str, default: int) -> int:
+    """Optional env int; invalid value par crash nahi (default + warning)."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; default %s use ho raha hai", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Optional env float; invalid value par crash nahi (default + warning)."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; default %s use ho raha hai", name, raw, default)
+        return default
+
+
 def _env_list(name: str, default: str = "") -> Set[int]:
     raw = os.getenv(name, default).strip()
     ids: Set[int] = set()
@@ -44,13 +68,13 @@ POST_BRANDING = os.getenv("POST_BRANDING", "1").strip().lower() in (
     "1", "true", "yes", "on"
 )
 
-CONCURRENCY = int(os.getenv("CONCURRENCY", "8"))
-TIMEOUT = float(os.getenv("TIMEOUT", "25"))
-ACC_TIMEOUT = float(os.getenv("ACC_TIMEOUT", "90"))
-RETRIES = int(os.getenv("RETRIES", "3"))
-MAX_FILES = int(os.getenv("MAX_FILES", "15000"))
-POST_MIN = float(os.getenv("POST_MIN", "45"))
-POST_MAX = float(os.getenv("POST_MAX", "110"))
+CONCURRENCY = max(_env_int("CONCURRENCY", 8), 1)
+TIMEOUT = max(_env_float("TIMEOUT", 25.0), 1.0)
+ACC_TIMEOUT = max(_env_float("ACC_TIMEOUT", 90.0), TIMEOUT)
+RETRIES = max(_env_int("RETRIES", 3), 1)
+MAX_FILES = max(_env_int("MAX_FILES", 15000), 1)
+POST_MIN = max(_env_float("POST_MIN", 45.0), 0.0)
+POST_MAX = max(_env_float("POST_MAX", 110.0), POST_MIN)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -71,8 +95,8 @@ NETCHECK_ON_START = os.getenv("NETCHECK_ON_START", "1").strip().lower() in ("1",
 STATE_DIR = os.getenv("STATE_DIR", "./data")
 
 # Zip bomb protection
-ZIP_MAX_TOTAL = int(os.getenv("ZIP_MAX_TOTAL", str(256 * 1024 * 1024)))  # 256MB default
-ZIP_MAX_FILE = int(os.getenv("ZIP_MAX_FILE", str(16 * 1024 * 1024)))  # 16MB per entry
+ZIP_MAX_TOTAL = max(_env_int("ZIP_MAX_TOTAL", 256 * 1024 * 1024), 1024)  # 256MB default
+ZIP_MAX_FILE = max(_env_int("ZIP_MAX_FILE", 16 * 1024 * 1024), 1024)  # 16MB per entry
 
 # Proxy pe DEAD milne par direct (Railway IP) se confirm karna (1 = haan).
 # Accuracy ke liye better, lekin Railway IP target site ko dik sakta hai.
@@ -81,15 +105,29 @@ VERIFY_CONFIRM_DEAD = os.getenv("VERIFY_CONFIRM_DEAD", "1").strip().lower() in (
 )
 
 # Bot version
-BOT_VERSION = "2.3.4"
+BOT_VERSION = "2.3.5"
 
 # Encryption key for cookie storage at rest
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
 if not ENCRYPTION_KEY:
     logger.critical(
         "ENCRYPTION_KEY env var is REQUIRED but not set. "
         "Cookies cannot be encrypted at rest. Generate one with: "
         "python -c \"from cryptography.fernet import Fernet; "
         "print(Fernet.generate_key().decode())\""
+    )
+    sys.exit(1)
+try:
+    # Non-empty but malformed key pehle silently plaintext cookies store karti
+    # thi (crypto._get_cipher None return karta tha). Production me fail-fast.
+    from cryptography.fernet import Fernet
+
+    Fernet(ENCRYPTION_KEY.encode())
+except Exception as exc:  # noqa: BLE001
+    logger.critical(
+        "Invalid ENCRYPTION_KEY (%s). Fernet key base64-encoded 32 bytes honi "
+        "chahiye. Generate: python -c \"from cryptography.fernet import Fernet; "
+        "print(Fernet.generate_key().decode())\"",
+        exc,
     )
     sys.exit(1)

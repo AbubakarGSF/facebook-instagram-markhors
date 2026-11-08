@@ -1,6 +1,5 @@
 """Tests for proxy parsing module."""
 
-import pytest
 from src.utils.proxy import norm_proxy
 
 

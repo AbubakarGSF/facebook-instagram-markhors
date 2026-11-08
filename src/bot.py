@@ -17,7 +17,7 @@ import shutil
 import tempfile
 import time
 import zipfile as _zipfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -58,7 +58,7 @@ from src.utils.crypto import decrypt_cookies, encrypt_cookies
 from src.utils.proxy import (
     add_proxy,
     get_active_proxies,
-    load_proxies,
+    get_configured_proxies,
     mask_proxy,
     mask_sensitive,
     norm_proxy,
@@ -70,6 +70,30 @@ from src.utils.proxy import (
 from src.utils.audit import audit_log
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    """Optional env float; invalid value par crash nahi, warning + default."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; default %s use ho raha hai", name, raw, default)
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    """Optional env int; '3.0' bhi accept, invalid par default."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return int(default)
+    try:
+        return int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; default %s use ho raha hai", name, raw, default)
+        return int(default)
 
 
 # ============================ GLOBAL STATE ============================
@@ -119,6 +143,11 @@ def _norm_meta(data: Dict[str, Any]) -> Dict[str, str]:
         "via": "Via",
         "reason": "Reason",
         "name": "Username",
+        "year": "Year",
+        "media_url": "Media URL",
+        "media url": "Media URL",
+        "access token": "Access Token",
+        "access_token": "Access Token",
     }
     out: Dict[str, str] = {}
     for k, v in (data or {}).items():
@@ -143,6 +172,8 @@ def branding_lines() -> List[str]:
 
 def post_signature(tag: str = "") -> str:
     """Campaign post ke end me branding block (links + hashtag)."""
+    # Huge tag footer ko 4096 limit se bahar le jata tha aur post fail hota tha.
+    tag = re.sub(r"[\x00-\x1f\x7f]", "", str(tag or "")).strip()[:80]
     lines = [tag] if tag else []
     lines.append(f"Website: {WEBSITE}")
     lines.append(f"WhatsApp: {WHATSAPP_URL}")
@@ -187,7 +218,8 @@ _PLAIN_META_KEYS = {
     "id", "username", "name", "country", "followers", "friends", "posts",
     "likes", "verified", "business", "marketplace", "year", "created",
     "suspended", "protected", "email", "phone", "status", "platform",
-    "media url", "media_url",
+    "media url", "media_url", "access token", "access_token", "token",
+    "api token",
 }
 
 # Lowercase header key -> output field name (campaign filters canonical keys
@@ -200,6 +232,7 @@ _META_CANON = {
     "created": "Created", "suspended": "Suspended", "protected": "Protected",
     "email": "Email", "phone": "Phone", "status": "Status",
     "platform": "Platform", "media url": "Media URL", "media_url": "Media URL",
+    "access token": "Access Token", "access_token": "Access Token",
 }
 
 
@@ -301,18 +334,40 @@ CAMPS: Dict[int, dict] = {}
 CAMPRUN: Dict[int, dict] = {}
 
 # User state TTL (minutes) - clean up old state entries
-USER_STATE_TTL_MIN = int(os.getenv("USER_STATE_TTL_MIN", "30"))
+USER_STATE_TTL_MIN = _env_int("USER_STATE_TTL_MIN", 30)
 
 # Per-user command rate limiting (seconds between commands)
-USER_CMD_COOLDOWN = float(os.getenv("USER_CMD_COOLDOWN", "2.0"))
+USER_CMD_COOLDOWN = _env_float("USER_CMD_COOLDOWN", 2.0)
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """Corrupt/legacy state values (text, nan, inf) par crash na karo."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number or number in (float("inf"), float("-inf")):
+        return default
+    return number
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """JSON/ENV style booleans: 'false', '0', 'no', 'off' -> False."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    if value is None:
+        return default
+    return bool(value)
 
 
 def _state_activity(st: dict) -> float:
     """State ka sab se recent activity timestamp (0 = unknown/old)."""
     return max(
-        float(st.get("at") or 0),
-        float(st.get("last_cmd") or 0),
-        float(st.get("last_content") or 0),
+        _as_float(st.get("at")),
+        _as_float(st.get("last_cmd")),
+        _as_float(st.get("last_content")),
     )
 
 
@@ -343,7 +398,7 @@ def cleanup_user_state():
         user_state.pop(uid, None)
 
     # Hard cap: TTL ke andar bhi hazaaron users state bana sakte hain.
-    max_entries = int(os.getenv("MAX_STATE_ENTRIES", "5000"))
+    max_entries = _env_int("MAX_STATE_ENTRIES", 5000)
     if len(user_state) > max_entries:
         oldest = sorted(
             user_state.items(), key=lambda kv: _state_activity(kv[1])
@@ -355,7 +410,7 @@ def cleanup_user_state():
     # wale naye campaign ko turant expire nahi karna.
     expired_camps = [
         uid for uid, cfg in CAMPS.items()
-        if now - (cfg.get("stage_at") or now) > ttl and uid not in CAMPRUN
+        if now - _as_float(cfg.get("stage_at"), now) > ttl and uid not in CAMPRUN
     ]
     for uid in expired_camps:
         CAMPS.pop(uid, None)
@@ -493,37 +548,23 @@ def load_camps():
             uid = int(fn[5:-5])
             with open(os.path.join(STATE_DIR, fn), encoding="utf-8") as f:
                 d = json.load(f)
-            base = new_camp()
-            base.update(d)
-            base["stage"] = "idle"
-            CAMPS[uid] = base
+            cfg = _safe_camp(d)
+            cfg["stage"] = "idle"
+            CAMPS[uid] = cfg
         except Exception:
             logging.exception("load_camp %s", fn)
 
 
-class _nullzip:
-    """Context manager for single .txt file (not a real zip)."""
-    def __init__(self, path: str):
-        self.path = path
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
-
-    def namelist(self):
-        return [os.path.basename(self.path)]
-
-    def read(self, name: str) -> str:
-        with open(self.path, encoding="utf-8", errors="ignore") as f:
-            return f.read()
-
-
 def safe_zip_entry_name(name: str) -> str:
     """Sanitize zip entry name to prevent path traversal (zip slip)."""
-    # Only use the basename - strips any directory components
-    return os.path.basename(name.replace("\\", "/"))
+    # Only use the basename - strips any directory components. ".", ".." aur
+    # control chars ko bhi reject karo, warna output zip me "working/.." jaisi
+    # entry ban sakti hai jo extract par parent directory hit karti hai.
+    base = os.path.basename(str(name or "").replace("\\", "/")).strip()
+    base = re.sub(r"[\x00-\x1f\x7f]", "", base)
+    if base in ("", ".", ".."):
+        return ""
+    return base
 
 
 def _pick_proxy() -> Optional[str]:
@@ -645,6 +686,103 @@ def _split_csv(values: List[str]) -> List[str]:
     ]
 
 
+_DELAY_RANGE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$")
+
+
+def _parse_delay_range(value: str) -> Optional[List[float]]:
+    """`/camp delay 45-110` -> [45.0, 110.0].
+
+    Negative, nan/inf, reversed aur bohat bade values reject (0..3600s).
+    """
+    m = _DELAY_RANGE_RE.match(str(value or ""))
+    if not m:
+        return None
+    try:
+        lo, hi = float(m.group(1)), float(m.group(2))
+    except ValueError:
+        return None
+    if not (0.0 <= lo <= 3600.0 and 0.0 <= hi <= 3600.0):
+        return None
+    return [min(lo, hi), max(lo, hi)]
+
+
+def _clamp_limit(value: Any, cap: int = MAX_FILES) -> Optional[int]:
+    """Campaign limit ko 0..MAX_FILES me clamp karo; invalid -> None."""
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if number < 0:
+        number = 0
+    upper = max(int(cap), 0)
+    return min(number, upper) if upper else 0
+
+
+def _safe_camp(raw: Any) -> dict:
+    """Purani/corrupt camp JSON ko safe shape me normalize karo.
+
+    `load_camps()` pehle file ka data seedha dict me daal deta tha; delay string
+    ya filter null hone par `/camp status` aur campaign loop crash kar sakte the.
+    """
+    cfg = new_camp()
+    if isinstance(raw, dict):
+        cfg.update(raw)
+
+    delay = cfg.get("delay")
+    if isinstance(delay, (list, tuple)) and len(delay) >= 2:
+        lo = _as_float(delay[0], POST_MIN)
+        hi = _as_float(delay[1], POST_MAX)
+        cfg["delay"] = [
+            min(max(lo, 0.0), 3600.0),
+            min(max(hi, 0.0), 3600.0),
+        ]
+    else:
+        cfg["delay"] = [POST_MIN, POST_MAX]
+
+    filt = cfg.get("filter")
+    if not isinstance(filt, dict):
+        filt = {}
+    countries = filt.get("countries") if isinstance(filt.get("countries"), list) else []
+    years = filt.get("years") if isinstance(filt.get("years"), list) else []
+    cfg["filter"] = {
+        "countries": [str(x).strip().upper() for x in countries if str(x).strip()],
+        "years": [str(x).strip() for x in years if str(x).strip()],
+        "min_followers": max(_to_int(filt.get("min_followers")), 0),
+    }
+
+    limit = _clamp_limit(cfg.get("limit"), MAX_FILES)
+    cfg["limit"] = 0 if limit is None else limit
+
+    texts = cfg.get("texts")
+    cfg["texts"] = (
+        [str(t) for t in texts if str(t).strip()]
+        if isinstance(texts, list) else []
+    )
+    media = cfg.get("media")
+    cfg["media"] = (
+        [m for m in media if isinstance(m, dict)]
+        if isinstance(media, list) else []
+    )
+
+    if cfg.get("platform") not in ("facebook", "instagram", ""):
+        cfg["platform"] = ""
+    if cfg.get("source") not in ("zip", "db"):
+        cfg["source"] = "zip"
+    cfg["tag"] = (
+        safe_text(str(cfg.get("tag") or DEFAULT_TAG), 80).strip()
+        or DEFAULT_TAG
+    )
+    cfg["stage"] = str(cfg.get("stage") or "idle")
+    cfg["stage_at"] = _as_float(cfg.get("stage_at"), time.time())
+    cfg["dry_run"] = _as_bool(cfg.get("dry_run"))
+    cfg["branding"] = _as_bool(cfg.get("branding"), True)
+    cfg["cleanup_partial"] = _as_bool(cfg.get("cleanup_partial"), True)
+    cfg["media_url"] = str(cfg.get("media_url") or "")
+    cfg["max_parts"] = max(_to_int(cfg.get("max_parts"), 3), 1)
+    return cfg
+
+
+
 def _status_folder(status: str) -> str:
     """Result status ko output folder name me map karo."""
     if status in ("LIVE", "REWORKED"):
@@ -666,7 +804,7 @@ class ProgressReporter:
         self.update_every = (
             update_every
             if update_every is not None
-            else float(os.getenv("PROGRESS_UPDATE_SEC", "3"))
+            else _env_float("PROGRESS_UPDATE_SEC", 3.0)
         )
         self.start = time.time()
         self.last = 0.0
@@ -770,12 +908,17 @@ def check_user_rate_limit(uid: int) -> bool:
 
 # Commands ke baad turant text/zip bhejna normal flow hai; command cooldown
 # (default 2s) content ko block nahi karna chahiye.
-CONTENT_COOLDOWN = float(os.getenv("CONTENT_COOLDOWN", "0.5"))
+CONTENT_COOLDOWN = _env_float("CONTENT_COOLDOWN", 0.5)
 
 # Ek cookie file ka max processing time (verify ke retries + slow retry cover
 # karne ke liye). Isse zyada hone par us file ko errors/ me daal kar aage barh
 # jate hain, warna ek hang poora zip stall kar deta hai.
-FILE_TIMEOUT = float(os.getenv("FILE_TIMEOUT", str(max(ACC_TIMEOUT, 180))))
+FILE_TIMEOUT = _env_float("FILE_TIMEOUT", max(ACC_TIMEOUT, 180.0))
+
+# /db export pagination: pehle sirf pehli 5000 rows aati thin aur export
+# chup-chaap adhoora hota tha.
+DB_EXPORT_PAGE = 1000
+DB_EXPORT_MAX_ROWS = _env_int("DB_EXPORT_MAX_ROWS", 20000)
 
 
 def check_content_rate_limit(uid: int) -> bool:
@@ -858,7 +1001,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Instagram: {'ON' if _ig_platform else 'OFF'}",
             f"DB: {'ON' if _db else 'OFF'}",
             f"Proxies: {len(get_active_proxies())} active / "
-            f"{len(load_proxies())} configured",
+            f"{len(get_configured_proxies())} configured",
             f"Campaigns: {len(CAMPS)} saved | {len(CAMPRUN)} running",
         ]
     await update.message.reply_text("\n".join(lines))
@@ -997,9 +1140,24 @@ async def run_netcheck() -> str:
             try:
                 r = await cl.get(url)
                 ms = (time.time() - started) * 1000
-                ok = r.status_code < 500
+                if r.status_code < 400:
+                    mark = "\u2713"
+                elif r.status_code < 500:
+                    # 4xx = host reachable but auth/region issue; 404 = path
+                    # galat. Inhe green tick dikhana diagnostic ko galat banata tha.
+                    mark = "\u26a0"
+                else:
+                    mark = "\u2717"
+                note = ""
+                if label == "Supabase" and r.status_code in (401, 403):
+                    # run_netcheck deliberately sends no apikey; 401 means host
+                    # reachable hai (key check alag hota hai), warning nahi.
+                    mark = "\u2713"
+                    note = " (reachable; auth required)"
+                elif label == "Supabase" and r.status_code == 404:
+                    note = " (URL/path issue)"
                 lines.append(
-                    f"{'✓' if ok else '✗'} {label}: HTTP {r.status_code} ({ms:.0f}ms)"
+                    f"{mark} {label}: HTTP {r.status_code}{note} ({ms:.0f}ms)"
                 )
             except Exception as e:  # noqa: BLE001
                 ms = (time.time() - started) * 1000
@@ -1095,16 +1253,30 @@ def _table_for(platform: str) -> str:
 
 async def _db_export(update: Update, context: ContextTypes.DEFAULT_TYPE, platform: str) -> None:
     table = _table_for(platform)
+    rows: List[Dict[str, Any]] = []
+    max_rows = max(DB_EXPORT_MAX_ROWS, 1)
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as cl:
-        rows = await _db.fetch(cl, table, {}, limit=5000)
+        offset = 0
+        while len(rows) < max_rows:
+            page_size = min(DB_EXPORT_PAGE, max_rows - len(rows))
+            page = await _db.fetch(cl, table, {}, limit=page_size, offset=offset)
+            if not page:
+                break
+            rows.extend(page)
+            offset += len(page)
+            if len(page) < page_size:
+                break
+    truncated = len(rows) >= max_rows
 
     if not rows:
-        await update.message.reply_text(f"{table}: koi row nahi.")
+        await update.message.reply_text(
+            f"{table}: koi row nahi (ya Supabase fetch error; logs dekho)."
+        )
         return
 
     fields = [
-        "id", "username", "fb_id", "ig_id", "country", "followers",
-        "verified", "status", "fails", "source", "created_at",
+        "id", "username", "fb_id", "ig_id", "country", "year", "followers",
+        "verified", "status", "fails", "source", "media_url", "created_at",
         "last_check", "last_ok", "last_post",
     ]
     buf = io.StringIO()
@@ -1114,11 +1286,14 @@ async def _db_export(update: Update, context: ContextTypes.DEFAULT_TYPE, platfor
         writer.writerow({k: row.get(k, "") for k in fields})
     data = io.BytesIO(buf.getvalue().encode("utf-8"))
 
+    caption = f"{table}: {len(rows)} rows (cookies/access_token excluded)"
+    if truncated:
+        caption += f" | limit {max_rows} hit (DB_EXPORT_MAX_ROWS)"
     await context.bot.send_document(
         update.effective_chat.id,
         document=data,
         filename=f"{table}.csv",
-        caption=f"{table}: {len(rows)} rows (cookies/access_token excluded)",
+        caption=caption,
     )
 
 
@@ -1133,7 +1308,9 @@ async def _db_reverify(update: Update, context: ContextTypes.DEFAULT_TYPE, platf
         rows = await _db.fetch(cl, table, {}, limit=min(max(limit, 1), 500))
 
     if not rows:
-        await update.message.reply_text(f"{table}: koi row nahi.")
+        await update.message.reply_text(
+            f"{table}: koi row nahi (ya Supabase fetch error; logs dekho)."
+        )
         return
 
     msg = await update.message.reply_text(f"DB reverify: {len(rows)} accounts...")
@@ -1406,13 +1583,16 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if sub == "limit":
-        try:
-            cfg["limit"] = max(int(args[1]), 0)
-        except Exception:
-            await update.message.reply_text("Number do.")
+        limit = _clamp_limit(args[1] if len(args) > 1 else "")
+        if limit is None:
+            await update.message.reply_text(
+                f"Number do (0 = unlimited, max {MAX_FILES})."
+            )
             return
+        cfg["limit"] = limit
         save_camp(uid)
-        await update.message.reply_text(f"Limit = {cfg['limit']}")
+        note = f" (max {MAX_FILES})" if limit == MAX_FILES and str(args[1]).strip() != str(MAX_FILES) else ""
+        await update.message.reply_text(f"Limit = {cfg['limit']}{note}")
         return
 
     if sub == "branding":
@@ -1436,20 +1616,24 @@ async def camp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not t:
             await update.message.reply_text("Tag do: /camp tag #EvilMarkhors")
             return
+        t = safe_text(t, 80).strip()
         cfg["tag"] = t if t.startswith("#") else "#" + t.lstrip("#")
         save_camp(uid)
         await update.message.reply_text(f"Tag = {cfg['tag']}")
         return
 
     if sub == "delay":
-        try:
-            lo, hi = args[1].split("-")
-            cfg["delay"] = [float(lo), float(hi)]
-        except Exception:
-            await update.message.reply_text("/camp delay 45-110")
+        delay = _parse_delay_range(" ".join(args[1:]))
+        if delay is None:
+            await update.message.reply_text(
+                "Delay 0-3600 seconds ke beech do, e.g. /camp delay 45-110"
+            )
             return
+        cfg["delay"] = delay
         save_camp(uid)
-        await update.message.reply_text(f"Delay = {cfg['delay']}")
+        await update.message.reply_text(
+            f"Delay = {cfg['delay'][0]:g}-{cfg['delay'][1]:g}s"
+        )
         return
 
     if sub == "dry":
@@ -1601,7 +1785,10 @@ async def _campaign_loop(
     filt = cfg["filter"]
     prog_total = len(accounts)
     posted_count = 0
-    failed_count = 0
+    dead_count = 0
+    unknown_count = 0
+    post_failed_count = 0
+    error_count = 0
     skipped_count = 0
     dry_count = 0
     unsupported_count = 0
@@ -1633,12 +1820,13 @@ async def _campaign_loop(
     media_url = str(cfg.get("media_url") or "")
 
     async def _do_account(acc):
-        nonlocal posted_count, failed_count, skipped_count, dry_count, unsupported_count, last_note
+        nonlocal posted_count, dead_count, unknown_count, post_failed_count
+        nonlocal error_count, skipped_count, dry_count, unsupported_count, last_note
         username = str(acc.get("username", "") or "")
 
         ck = acc.get("cookies", {})
         if not ck:
-            failed_count += 1
+            error_count += 1
             last_note = f"NO COOKIES | {username}"
             return
         ck = decrypt_cookies(ck)
@@ -1653,7 +1841,12 @@ async def _campaign_loop(
         uname = safe_text(uname)
 
         if status != "LIVE":
-            failed_count += 1
+            # Verify DEAD aur network UNKNOWN ko alag count karo; dono ko
+            # "dead" dikhana DB/audit ke numbers ko galat banata tha.
+            if status == "DEAD":
+                dead_count += 1
+            else:
+                unknown_count += 1
             last_note = f"{status} ({check.get('via', '-')}) {check.get('Reason', '')[:40]} | {uname}"
             if _db and uname and db_client is not None:
                 try:
@@ -1729,6 +1922,10 @@ async def _campaign_loop(
                     "last_ok": now,
                     "last_post": now,
                 }
+                # Token sirf tab save karo jab mila ho; empty value existing DB
+                # token ko overwrite kar deti thi.
+                if access_token:
+                    row["access_token"] = access_token
                 try:
                     if db_client is not None:
                         saved, db_err = await _db.upsert(
@@ -1748,11 +1945,11 @@ async def _campaign_loop(
             unsupported_count += 1
             last_note = f"UNSUPPORTED post | {uname}"
         else:
-            failed_count += 1
+            post_failed_count += 1
             last_note = f"POST FAILED: {err or 'unknown'} | {uname}"
 
     async def process_account(acc):
-        nonlocal done_count, last_note, failed_count
+        nonlocal done_count, last_note, error_count
         if state.get("stop") or CAMPRUN.get(uid, {}).get("stop"):
             return
         username = str(acc.get("username", "") or "?")
@@ -1761,11 +1958,11 @@ async def _campaign_loop(
                 return
             await asyncio.wait_for(_do_account(acc), timeout=max(ACC_TIMEOUT, 10.0))
         except asyncio.TimeoutError:
-            failed_count += 1
+            error_count += 1
             last_note = f"TIMEOUT ({ACC_TIMEOUT:.0f}s) | {username}"
         except Exception as e:  # noqa: BLE001
             logger.exception("campaign account failed: %s", username)
-            failed_count += 1
+            error_count += 1
             last_note = f"ERROR {type(e).__name__} | {username}"
         finally:
             done_count += 1
@@ -1774,9 +1971,9 @@ async def _campaign_loop(
                     done_count,
                     {
                         "working": posted_count,
-                        "dead": failed_count,
-                        "unknown": skipped_count + dry_count + unsupported_count,
-                        "errors": 0,
+                        "dead": dead_count,
+                        "unknown": unknown_count + skipped_count + dry_count + unsupported_count,
+                        "errors": post_failed_count + error_count,
                     },
                     last=last_note,
                 )
@@ -1805,7 +2002,8 @@ async def _campaign_loop(
     summary = (
         f"Campaign complete! ({prog_total} accounts)\n"
         f"Posted: {posted_count}\n"
-        f"Failed: {failed_count}\n"
+        f"Verify DEAD: {dead_count} | Verify UNKNOWN: {unknown_count}\n"
+        f"Post failed: {post_failed_count} | Errors: {error_count}\n"
         f"Unsupported (token/media missing): {unsupported_count}\n"
         f"Skipped (filter): {skipped_count}\n"
         f"Dry run: {dry_count}\n"
@@ -1868,6 +2066,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_proxy = bool(get_active_proxies())
     no_proxy_note = "" if has_proxy else " | ⚠️ proxy OFF (direct traffic)"
 
+    is_zip = doc.file_name.lower().endswith(".zip")
+    # Declared size check: bada single .txt pehle hi reject karo, warna poora
+    # file disk/memory me aa jata tha (zip path me per-entry cap tha, txt me nahi).
+    declared_size = int(getattr(doc, "file_size", 0) or 0)
+    declared_limit = ZIP_MAX_TOTAL if is_zip else ZIP_MAX_FILE
+    if declared_size > declared_limit:
+        await msg.edit_text(
+            f"File too large: {declared_size // (1024 * 1024)}MB "
+            f"(limit {declared_limit // (1024 * 1024)}MB)."
+        )
+        return
+
     tmp = tempfile.mkdtemp(prefix="sm_")
     # Poore upload ke liye ek DB client (per-file client 15k files par slow).
     db_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0)) if _db else None
@@ -1876,7 +2086,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path = os.path.join(tmp, os.path.basename(doc.file_name))
         await file.download_to_drive(path)
 
-        is_zip = doc.file_name.lower().endswith(".zip")
         if is_zip:
             if not _zipfile.is_zipfile(path):
                 await msg.edit_text("Invalid zip file.")
@@ -1905,7 +2114,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def process_entry(name: str, raw: str):
             try:
                 return await asyncio.wait_for(
-                    _process_one(name, raw, state, db_client=db_client),
+                    _process_one(
+                        name,
+                        raw,
+                        state,
+                        db_client=db_client,
+                        # Campaign me output zip banega hi nahi; bade zip par
+                        # 15k full cookie files memory me rakhna waste tha.
+                        build_output=(mode != "campaign"),
+                    ),
                     timeout=FILE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -2048,7 +2265,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
         else:
             with open(path, encoding="utf-8", errors="ignore") as fh:
-                raw = fh.read()
+                raw = fh.read(ZIP_MAX_FILE + 1)
+            if len(raw) > ZIP_MAX_FILE:
+                await msg.edit_text(
+                    f"File too large (limit {ZIP_MAX_FILE // (1024 * 1024)}MB)."
+                )
+                return
             result = await process_entry(doc.file_name, raw)
             record(result, 1)
 
@@ -2260,7 +2482,7 @@ async def _verify_cookie(platform_obj: BasePlatform, cookies: Dict[str, str], pr
     if final:
         # Dono routes UNKNOWN (network/proxy glitch) — thoda wait karke ek aur try
         if final.get("Status") == "UNKNOWN":
-            delay = int(os.getenv("VERIFY_SLOW_RETRY_SEC", "5") or 0)
+            delay = _env_int("VERIFY_SLOW_RETRY_SEC", 5)
             if delay > 0:
                 logger.info("verify: all routes UNKNOWN, slow retry in %ss", delay)
                 await asyncio.sleep(delay)
@@ -2301,6 +2523,7 @@ async def _process_one(
     raw: str,
     state: dict,
     db_client: Optional[httpx.AsyncClient] = None,
+    build_output: bool = True,
 ) -> tuple:
     """Process a single cookie file."""
     bp = BasePlatform()
@@ -2332,7 +2555,7 @@ async def _process_one(
             "Platform": "unknown",
             "Checked": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         })
-        output = build_cookie_file(meta, cookie_lines)
+        output = build_cookie_file(meta, cookie_lines) if build_output else ""
         return (name, output, status, cookie_data, meta)
 
     platform_obj = get_platform(platform)
@@ -2366,7 +2589,7 @@ async def _process_one(
     })
     if check.get("via"):
         meta["Via"] = str(check["via"])
-    output = build_cookie_file(meta, cookie_lines)
+    output = build_cookie_file(meta, cookie_lines) if build_output else ""
 
     # Save every verified result (LIVE/DEAD/UNKNOWN) so /db stats and
     # /db reverify see reality. Rework-only runs (no live check) are not saved.
@@ -2395,6 +2618,9 @@ async def _process_one(
                 "source": "verify",
                 "last_check": now,
             }
+            token = _meta_first(meta, "access token", "access_token", "token")
+            if token:
+                row["access_token"] = token
             if status == "LIVE":
                 row["last_ok"] = now
             try:
@@ -2462,7 +2688,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Empty text not allowed.")
         return
 
-    max_variants = int(os.getenv("MAX_TEXT_VARIANTS", "20"))
+    max_variants = _env_int("MAX_TEXT_VARIANTS", 20)
     if len(cfg["texts"]) >= max_variants:
         await update.message.reply_text(
             f"Variant limit {max_variants} hai. /camp reset karke naya campaign banao."
@@ -2470,6 +2696,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cfg["texts"].append(text)
+    cfg["stage_at"] = time.time()
     save_camp(uid)
     await update.message.reply_text(
         f"Variant {len(cfg['texts'])} added: {safe_text(text, 80)}\n"
@@ -2507,6 +2734,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     cfg["media"].append(entry)
+    cfg["stage_at"] = time.time()
     save_camp(uid)
     await msg.reply_text(
         f"Media {len(cfg['media'])} added ({entry['type']}).\n"

@@ -31,8 +31,12 @@ _PROXIES_LOADED = False
 
 def check_socksio() -> bool:
     """Check if socksio is installed for SOCKS5 proxy support."""
+    # importlib use karte hain taake availability check par unused-import
+    # warning na aaye; side effect (module registration) same rehta hai.
     try:
-        import socksio
+        import importlib
+
+        importlib.import_module("socksio")
         return True
     except ImportError:
         return False
@@ -261,6 +265,13 @@ def get_active_proxies() -> List[str]:
         return []
     # Sirf pehli baar load karo. PROXIES khaali hone par har verify par file
     # reload + invalid warnings repeat hote the (log spam / IO).
+    if not PROXIES and not _PROXIES_LOADED:
+        load_proxies()
+    return list(PROXIES)
+
+
+def get_configured_proxies() -> List[str]:
+    """Configured proxies regardless of /proxy off (status display ke liye)."""
     if not PROXIES and not _PROXIES_LOADED:
         load_proxies()
     return list(PROXIES)

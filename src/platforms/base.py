@@ -27,7 +27,13 @@ SKIP_KEYS = {
     "2fa", "twofa", "card", "card added", "business", "marketplace",
     "year", "created", "suspended", "protected", "verified type",
     "homepage", "website", "url", "link", "source", "note", "notes",
+    "access token", "api token", "api_token", "target id", "media url",
 }
+
+# Cookie file abuse guards: 16MB file me hazaron cookie lines ho sakti hain;
+# unhe HTTP header me bhejna request ko blow up kar deta hai.
+MAX_COOKIES_PER_FILE = 200
+MAX_COOKIE_VALUE_LEN = 4096
 
 
 class BasePlatform:
@@ -80,6 +86,8 @@ class BasePlatform:
         exp = int(time.time()) + 86400 * 30
 
         for line in (text or "").splitlines():
+            if len(data) >= MAX_COOKIES_PER_FILE:
+                break
             line = line.rstrip("\r")
             httponly = line.startswith("#HttpOnly_")
             if httponly:
@@ -99,7 +107,10 @@ class BasePlatform:
                     expiry = str(exp)
                 name = parts[5].strip()
                 val = parts[6].strip()
-                if name and val and name not in seen:
+                if (
+                    name and val and name not in seen
+                    and len(val) <= MAX_COOKIE_VALUE_LEN
+                ):
                     seen.add(name)
                     data[name] = val
                     cookie = f"{domain}\t{flag}\t{cpath}\t{secure}\t{expiry}\t{name}\t{val}"
@@ -116,6 +127,8 @@ class BasePlatform:
             sep = m.group(2)
             v = m.group(3).strip().strip('"').strip("'")
             if not k or not v or k in seen:
+                continue
+            if len(v) > MAX_COOKIE_VALUE_LEN:
                 continue
             if k.lower() in SKIP_KEYS:
                 continue
