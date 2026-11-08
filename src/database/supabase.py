@@ -6,6 +6,7 @@ Alag tables Facebook aur Instagram ke liye:
 """
 
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -56,6 +57,54 @@ class SupabaseDB:
                 return col, str(val)
         return "", ""
 
+    # Optional campaign columns. Purane deployments me ye columns nahi hote;
+    # upsert pehle full payload bhejta hai aur sirf missing-column error par
+    # inhe strip karke retry karta hai (schema apply karte hi data save hone lagega).
+    OPTIONAL_COLUMNS = ("year", "media_url")
+
+    @classmethod
+    def _missing_columns(cls, error_text: str) -> set:
+        text = (error_text or "").lower()
+        if not text or ("column" not in text and "schema cache" not in text):
+            return set()
+        # PostgREST ek hi missing column ka naam deta hai; baqi optional columns
+        # bhi purane schema me missing ho sakte hain, is liye sab strip karo.
+        if "schema cache" in text or "could not find the" in text:
+            return set(cls.OPTIONAL_COLUMNS)
+        return {
+            col for col in cls.OPTIONAL_COLUMNS
+            if re.search(rf"['\"]?{col}['\"]?", text)
+        }
+
+    async def _send_json(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        payload: Any,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """POST/PATCH with one retry after stripping unknown optional columns."""
+        fn = getattr(client, method)
+        r = await fn(url, json=payload, **kwargs)
+        if r.status_code < 300:
+            return r
+        missing = self._missing_columns(r.text)
+        if not missing:
+            return r
+        if isinstance(payload, list):
+            slim = [
+                {k: v for k, v in row.items() if k not in missing}
+                for row in payload
+            ]
+        else:
+            slim = {k: v for k, v in payload.items() if k not in missing}
+        logger.warning(
+            "supabase: optional column(s) %s missing, retrying without them",
+            sorted(missing),
+        )
+        return await fn(url, json=slim, **kwargs)
+
     async def upsert(self, client: httpx.AsyncClient, table: str, rows: List[Dict[str, Any]]) -> Tuple[int, Optional[str]]:
         """Upsert rows. Returns (ok_count, error_message).
 
@@ -86,11 +135,13 @@ class SupabaseDB:
             return 0, "no username"
 
         try:
-            r = await client.post(
+            r = await self._send_json(
+                client,
+                "post",
                 self.table_url(table),
+                cleaned,
                 params={"on_conflict": "username"},
                 headers={**self.headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
-                json=cleaned,
             )
             if r.status_code < 300:
                 return len(cleaned), None
@@ -127,28 +178,34 @@ class SupabaseDB:
         try:
             # 1) Existing row with same platform id -> patch it.
             if id_col:
-                r = await client.patch(
+                r = await self._send_json(
+                    client,
+                    "patch",
                     self.table_url(table),
+                    payload,
                     params={id_col: f"eq.{id_val}"},
                     headers={**self.headers, "Prefer": "return=representation"},
-                    json=payload,
                 )
                 if r.status_code < 300 and self._json_body(r):
                     return True
             # 2) Existing row with same username -> patch it.
-            r = await client.patch(
+            r = await self._send_json(
+                client,
+                "patch",
                 self.table_url(table),
+                payload,
                 params={"username": f"eq.{row['username']}"},
                 headers={**self.headers, "Prefer": "return=representation"},
-                json=payload,
             )
             if r.status_code < 300 and self._json_body(r):
                 return True
             # 3) Brand-new row.
-            r = await client.post(
+            r = await self._send_json(
+                client,
+                "post",
                 self.table_url(table),
+                [payload],
                 headers={**self.headers, "Prefer": "resolution=ignore-duplicates,return=minimal"},
-                json=[payload],
             )
             return r.status_code < 300
         except Exception:  # noqa: BLE001

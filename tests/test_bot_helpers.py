@@ -291,6 +291,8 @@ def test_parse_meta_plain_headers_without_dash():
     # Lowercase header bhi canonical field me normalize hota hai.
     low = b.parse_meta("country: pk\nyear: 2016\n", "y.txt")
     assert low["Country"] == "pk" and low["Year"] == "2016"
+    media = b.parse_meta("Media URL: https://cdn.example.com/a.jpg\n", "z.txt")
+    assert media["Media URL"] == "https://cdn.example.com/a.jpg"
 
 
 def test_meta_first_is_case_insensitive():

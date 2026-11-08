@@ -8,6 +8,8 @@ create table if not exists fb_accounts (
   access_token text,
   cookies jsonb not null,
   country text,
+  year text,
+  media_url text,
   followers int default 0,
   verified boolean default false,
   status text default 'live',
@@ -21,6 +23,10 @@ create table if not exists fb_accounts (
 create index if not exists fb_accounts_status_idx on fb_accounts (status);
 create index if not exists fb_accounts_username_idx on fb_accounts (username);
 
+-- Existing deployments: optional campaign columns (safe to re-run).
+alter table fb_accounts add column if not exists year text;
+alter table fb_accounts add column if not exists media_url text;
+
 create table if not exists ig_accounts (
   id bigserial primary key,
   username text unique,
@@ -28,6 +34,8 @@ create table if not exists ig_accounts (
   access_token text,
   cookies jsonb not null,
   country text,
+  year text,
+  media_url text,
   followers int default 0,
   verified boolean default false,
   status text default 'live',
@@ -40,6 +48,10 @@ create table if not exists ig_accounts (
 );
 create index if not exists ig_accounts_status_idx on ig_accounts (status);
 create index if not exists ig_accounts_username_idx on ig_accounts (username);
+
+-- Existing deployments: optional campaign columns (safe to re-run).
+alter table ig_accounts add column if not exists year text;
+alter table ig_accounts add column if not exists media_url text;
 
 -- RLS enable (service_role bypasses, but good practice)
 alter table fb_accounts enable row level security;

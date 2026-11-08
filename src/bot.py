@@ -187,6 +187,7 @@ _PLAIN_META_KEYS = {
     "id", "username", "name", "country", "followers", "friends", "posts",
     "likes", "verified", "business", "marketplace", "year", "created",
     "suspended", "protected", "email", "phone", "status", "platform",
+    "media url", "media_url",
 }
 
 # Lowercase header key -> output field name (campaign filters canonical keys
@@ -198,7 +199,7 @@ _META_CANON = {
     "business": "Business", "marketplace": "Marketplace", "year": "Year",
     "created": "Created", "suspended": "Suspended", "protected": "Protected",
     "email": "Email", "phone": "Phone", "status": "Status",
-    "platform": "Platform",
+    "platform": "Platform", "media url": "Media URL", "media_url": "Media URL",
 }
 
 
@@ -1718,6 +1719,8 @@ async def _campaign_loop(
                     "ig_id": str(check.get("ig_id") or (target_id if platform == "instagram" else "")) or "",
                     "cookies": encrypt_cookies(ck),
                     "country": country,
+                    "year": str(acc.get("year") or ""),
+                    "media_url": media or "",
                     "followers": followers,
                     "verified": bool(acc.get("verified")) or str(check.get("Verified", "")).lower() == "true",
                     "status": "live",
@@ -2089,6 +2092,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "access_token": _meta_first(
                         meta, "access token", "access_token", "token"
                     ),
+                    "media_url": _meta_first(meta, "media url", "media_url"),
                     "target_id": str(meta.get("ID", "")),
                 })
             if cfg and cfg.get("limit"):
@@ -2384,6 +2388,7 @@ async def _process_one(
                 if platform == "instagram" else "",
                 "cookies": encrypt_cookies(cookie_data),
                 "country": norm.get("Country", ""),
+                "year": str(norm.get("Year", "") or ""),
                 "followers": _to_int(norm.get("Followers")),
                 "verified": str(norm.get("Verified", "false")).lower() == "true",
                 "status": status.lower(),

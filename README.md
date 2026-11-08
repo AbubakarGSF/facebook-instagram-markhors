@@ -137,6 +137,12 @@ DB row ke liye owner id session cookie se bhi li jati hai (`c_user` FB,
 - Cookies `ENCRYPTION_KEY` se encrypt hokar save hoti hain.
 - Rework-only run (live check OFF) DB me kuch save nahi karta.
 - Campaign post success par row `status=live`, `last_post` ke saath upsert hoti hai.
+- `year` aur `media_url` optional columns hain (`schema.sql` me included).
+  Purane deployment me `schema.sql` dobara chalao. Bot in columns ke bina bhi
+  chalta hai: upsert missing-column error par sirf ye fields strip karke retry
+  karta hai.
+- DB source campaign ka `year` filter aur per-account media URL inhi columns se
+  aata hai (zip source me file header/filename se).
 
 ## Posting reality
 
